@@ -123,8 +123,12 @@ class Flux2Adapter(BaseAdapter):
         # Format input messages
         messages_batch = format_input(prompts=prompt, system_message=system_message)
 
+        tokenizer = self.pipeline.tokenizer
+        if hasattr(tokenizer, "tokenizer"):
+            tokenizer = tokenizer.tokenizer
+
         # Process all messages at once
-        inputs = self.pipeline.tokenizer.apply_chat_template(
+        inputs = tokenizer.apply_chat_template(
             messages_batch,
             add_generation_prompt=False,
             tokenize=True,
@@ -135,9 +139,23 @@ class Flux2Adapter(BaseAdapter):
             max_length=max_sequence_length,
         )
 
-        # Move to device
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
+        if isinstance(inputs, dict) or (
+            hasattr(inputs, "keys") and "input_ids" in inputs
+        ):
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs["attention_mask"].to(device)
+        else:
+            input_ids = inputs.to(device)
+            pad_token_id = getattr(tokenizer, "pad_token_id", None)
+            if pad_token_id is None:
+                pad_token_id = getattr(tokenizer, "eos_token_id", None)
+
+            if pad_token_id is not None:
+                attention_mask = (input_ids != pad_token_id).to(device)
+            else:
+                attention_mask = torch.ones_like(
+                    input_ids, dtype=torch.bool, device=device
+                )
 
         # Forward pass through the model
         output = self.pipeline.text_encoder(
