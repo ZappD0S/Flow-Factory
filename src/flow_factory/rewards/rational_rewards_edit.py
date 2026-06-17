@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from accelerate import Accelerator
@@ -248,19 +248,29 @@ def build_scoring_messages_edit(
     ]
 
 
-def _first_condition_image(cond: Union[Image.Image, List[Image.Image]]) -> Image.Image:
+def _get_condition_image(
+    cond: Union[Image.Image, List[Image.Image]], idx: int
+) -> Image.Image:
     if isinstance(cond, list):
         if not cond:
             raise ValueError(
                 "condition_images entry is an empty list; need at least one source image"
             )
-        first = cond[0]
-        if not isinstance(first, Image.Image):
+        if idx < 0 or idx >= len(cond):
+            raise ValueError("The index provided is out of range")
+
+        img = cond[idx]
+
+        if not isinstance(img, Image.Image):
             raise TypeError(
-                f"expected PIL.Image.Image inside condition_images list, got {type(first).__name__}"
+                f"expected PIL.Image.Image inside condition_images list, got {type(img).__name__}"
             )
-        return first
+
+        return img
     if isinstance(cond, Image.Image):
+        if idx != 0:
+            raise ValueError("The index provided is out of range")
+
         return cond
     raise TypeError(
         f"expected PIL.Image.Image or list of PIL images for condition_images element, "
@@ -300,6 +310,7 @@ class RationalRewardsEditRewardModel(PointwiseRewardModel):
         self.timeout = float(config.extra_kwargs.get("timeout", 180.0))
         self.temperature = float(config.extra_kwargs.get("temperature", 0.1))
         self.max_tokens = int(config.extra_kwargs.get("max_tokens", 2048))
+        self.source_image_index = int(config.extra_kwargs.get("source_image_index", 0))
 
         raw_aspects = config.extra_kwargs.get("aspects")
         if raw_aspects is None:
@@ -341,7 +352,9 @@ class RationalRewardsEditRewardModel(PointwiseRewardModel):
                 f"{len(prompt)}, {len(image)}, {len(condition_images)}"
             )
 
-        source_images = [_first_condition_image(c) for c in condition_images]
+        source_images = [
+            _get_condition_image(c, self.source_image_index) for c in condition_images
+        ]
         scores = asyncio.run(self._run_batch(prompt, source_images, image))
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
         return RewardModelOutput(rewards=rewards, extra_info={})

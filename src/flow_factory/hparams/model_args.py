@@ -83,6 +83,12 @@ class ModelArguments(ArgABC):
         metadata={"help": "Alpha scaling factor for LoRA adapters. Default to `2 * lora_rank` if None."},
     )
 
+    conditioning_image_indices: Optional[List[int]] = field(
+        default=None,
+        metadata={"help": "List of 0-based indices of conditioning images to select from the dataset. If None, all are used."}
+    )
+
+
     resume_path : Optional[str] = field(
         default=None,
         metadata={
