@@ -259,7 +259,7 @@ class Flux2Adapter(BaseAdapter):
 
         if indices is not None:
             selected_condition_images_tensors = [
-                [t[i] for i in indices if 0 <= i < len(condition_image_tensors)]
+                [t[i] for i in indices if 0 <= i < len(t)]
                 for t in condition_image_tensors
             ]
         else:
