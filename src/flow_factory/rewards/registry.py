@@ -35,7 +35,7 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'vllm_evaluate': 'flow_factory.rewards.vllm_evaluate.VLMEvaluateRewardModel',
     'rational_rewards_t2i': 'flow_factory.rewards.rational_rewards_t2i.RationalRewardsT2IRewardModel',
     'rational_rewards_edit': 'flow_factory.rewards.rational_rewards_edit.RationalRewardsEditRewardModel',
-    'rational_rewards_vto': 'flow_factory.rewards.rational_rewards_edit.RationalRewardsVTORewardModel',
+    'rational_rewards_vto': 'flow_factory.rewards.rational_rewards_vto.RationalRewardsVTORewardModel',
     'geneval': 'flow_factory.rewards.geneval.GenEvalRewardModel',
     'geneval2_soft_tifa': 'flow_factory.rewards.geneval2_soft_tifa.GenEval2SoftTIFARewardModel',
     'hpsv2': 'flow_factory.rewards.hpsv2_reward.HPSv2RewardModel',
