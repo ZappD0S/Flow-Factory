@@ -78,6 +78,8 @@ class Flux2Adapter(BaseAdapter):
         self.pipeline: Flux2Pipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
         
+        self.conditioning_image_indices = config.model_args.conditioning_image_indices
+
         self._has_warned_inference_fallback = False
         self._has_warned_forward_fallback = False
         self._has_warned_preprocess_fallback = False
@@ -213,7 +215,6 @@ class Flux2Adapter(BaseAdapter):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         generator: Optional[torch.Generator] = None,
-        conditioning_image_indices: Optional[List[int]] = None,
     ) -> Dict[str, Union[List[List[torch.Tensor]], List[torch.Tensor]]]:
         """
         Encode input condition image(s) into latent representations using the Flux.2 image encoder.
@@ -228,7 +229,6 @@ class Flux2Adapter(BaseAdapter):
             device: Device to place tensors on
             dtype: Data type for tensors
             generator: Random generator for encoding (not used, kept for API consistency)
-            conditioning_image_indices: Optional list of indices to filter images to encode.
         
         Returns:
             Dictionary containing:
@@ -255,16 +255,14 @@ class Flux2Adapter(BaseAdapter):
         ]
 
         # Determine which images to VAE-encode
-        indices = conditioning_image_indices
+        indices = self.conditioning_image_indices
 
         if indices is not None:
-            logger.info("conditioning_image_indices is present")
             selected_condition_images_tensors = [
                 [t[i] for i in indices if 0 <= i < len(condition_image_tensors)]
                 for t in condition_image_tensors
             ]
         else:
-            logger.info("conditioning_image_indices is missing")
             selected_condition_images_tensors = condition_image_tensors
         
         # Encode each batch separately
@@ -411,7 +409,6 @@ class Flux2Adapter(BaseAdapter):
         text_encoder_out_layers: Tuple[int, ...] = (10, 20, 30),
         generator: Optional[torch.Generator] = None,
         device: Optional[torch.device] = None,
-        conditioning_image_indices: Optional[List[int]] = None,
     ) -> Dict[str, Union[List[Any], torch.Tensor]]:
         """
         Preprocess inputs for Flux.2 model (batched processing).
@@ -425,7 +422,6 @@ class Flux2Adapter(BaseAdapter):
             text_encoder_out_layers: Layers to extract from text encoder
             generator: Random generator for encoding (not used, kept for API consistency)
             device: Target device for output tensors. If None, uses the component's own device.
-            conditioning_image_indices: Optional list of indices to filter images to encode.
 
         Returns:
             Dictionary with all encoded data in list format for consistency
@@ -469,7 +465,6 @@ class Flux2Adapter(BaseAdapter):
                 condition_image_size=condition_image_size,
                 device=device,
                 generator=generator,
-                conditioning_image_indices=conditioning_image_indices,
             )
             # image_dict already returns lists, so directly merge
             batch.update(image_dict)
@@ -508,7 +503,6 @@ class Flux2Adapter(BaseAdapter):
         # Extra callback arguments
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
-        conditioning_image_indices: Optional[List[int]] = None,
     ) -> List[Flux2Sample]:
         """
         Inference method for Flux.2 model for a single sample.
@@ -533,7 +527,6 @@ class Flux2Adapter(BaseAdapter):
                 max_sequence_length=max_sequence_length,
                 caption_upsample_temperature=caption_upsample_temperature,
                 condition_image_size=condition_image_size,
-                conditioning_image_indices=conditioning_image_indices,
             )
             prompt_ids = encode_dict['prompt_ids']
             prompt_embeds = encode_dict['prompt_embeds']
@@ -701,7 +694,6 @@ class Flux2Adapter(BaseAdapter):
         compute_log_prob: bool = False,
         extra_call_back_kwargs: List[str] = [],
         trajectory_indices: TrajectoryIndicesType = 'all',
-        conditioning_image_indices: Optional[List[int]] = None,
     ) -> List[Flux2Sample]:
         """Batch inference for Flux2"""
         if isinstance(prompt, str):
@@ -742,7 +734,6 @@ class Flux2Adapter(BaseAdapter):
                 compute_log_prob=compute_log_prob,
                 extra_call_back_kwargs=extra_call_back_kwargs,
                 trajectory_indices=trajectory_indices,
-                conditioning_image_indices=conditioning_image_indices,
             )
     
         # Ragged case: per-sample fallback
@@ -793,7 +784,6 @@ class Flux2Adapter(BaseAdapter):
                 compute_log_prob=compute_log_prob,
                 extra_call_back_kwargs=extra_call_back_kwargs,
                 trajectory_indices=trajectory_indices,
-                conditioning_image_indices=conditioning_image_indices,
             )
             samples.extend(sample)
         return samples
