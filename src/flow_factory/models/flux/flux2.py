@@ -256,15 +256,15 @@ class Flux2Adapter(BaseAdapter):
 
         # Determine which images to VAE-encode
         indices = conditioning_image_indices
-        if indices is None:
-            indices = getattr(self.config.model, "conditioning_image_indices", None)
 
         if indices is not None:
+            logger.info("conditioning_image_indices is present")
             selected_condition_images_tensors = [
                 [t[i] for i in indices if 0 <= i < len(condition_image_tensors)]
                 for t in condition_image_tensors
             ]
         else:
+            logger.info("conditioning_image_indices is missing")
             selected_condition_images_tensors = condition_image_tensors
         
         # Encode each batch separately
