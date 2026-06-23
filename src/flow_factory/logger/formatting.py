@@ -720,7 +720,60 @@ class LogTable:
             rows.append(row)
         
         return cls(columns=columns, rows=rows, target_height=target_height) if rows else None
-    
+
+    @classmethod
+    def from_vto_samples(cls, samples: List[I2ISample]) -> Optional['LogTable']:
+        """Build table from VTO samples: [condition_images...] -> generated + VLM scores."""
+        if not samples:
+            return None
+
+        first_conds = _to_pil_list(samples[0].condition_images)
+        n_conds = len(first_conds)
+        columns = (
+            [f"condition_{i}" for i in range(n_conds)]
+            + ["generated"]
+            + ["garment_transfer", "attribute_preservation", "physical_quality", "source_integrity"]
+            + ["aggregate", "vlm_judgment"]
+        )
+
+        rows = []
+        target_height = None
+
+        for s in samples:
+            if s.image is None:
+                continue
+            conds = _to_pil_list(s.condition_images)[:n_conds]
+            gen_imgs = _to_pil_list(s.image)
+            if not gen_imgs:
+                continue
+            gen_img = gen_imgs[0]
+
+            if target_height is None:
+                target_height = gen_img.size[1]
+
+            cond_items: List[Optional[LogImage]] = [LogImage(c) for c in conds]
+
+            vlm_info = s.extra_kwargs.get('vlm_judgments', {})
+            parsed = vlm_info.get('parsed_scores', {})
+            rewards_dict = s.extra_kwargs.get('rewards', {})
+            agg = float(rewards_dict.get('vlm_judge', float('nan')))
+
+            row: List[Optional[Union[LogImage, str]]] = (
+                cond_items + [None] * (n_conds - len(conds))
+                + [LogImage(gen_img)]
+                + [
+                    str(parsed.get('garment_transfer', '-')),
+                    str(parsed.get('attribute_preservation', '-')),
+                    str(parsed.get('physical_quality', '-')),
+                    str(parsed.get('source_integrity', '-')),
+                ]
+                + [f"{agg:.3f}" if not math.isnan(agg) else "-"]
+                + [vlm_info.get('vlm_content', '')]
+            )
+            rows.append(row)
+
+        return cls(columns=columns, rows=rows, target_height=target_height) if rows else None
+
     def cleanup(self):
         """Remove all temporary files from contained LogImage/LogVideo items."""
         for row in self.rows:
@@ -844,8 +897,14 @@ class LogFormatter:
         return LogTable.from_i2av_samples(samples)
 
     @classmethod
-    def _process_i2i_samples(cls, samples: List[I2ISample]) -> List[Union[LogImage, None]]:
+    def _process_i2i_samples(cls, samples: List[I2ISample]) -> Union[List[Union[LogImage, None]], LogTable]:
         """Handle sample with condition images + generated image, concatenated in grid."""
+        # If VLM judgment data is present, render as a structured table
+        if samples and any('vlm_judgments' in s.extra_kwargs for s in samples):
+            table = LogTable.from_vto_samples(samples)
+            if table is not None:
+                return table
+
         def _process_single_i2i_sample(sample: I2ISample) -> Optional[LogImage]:
             cond_imgs = _to_pil_list(sample.condition_images)
             gen_imgs = _to_pil_list(sample.image)

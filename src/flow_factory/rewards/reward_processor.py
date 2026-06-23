@@ -275,6 +275,11 @@ class RewardProcessor:
             output.rewards if hasattr(output, 'rewards') else output,
             dtype=torch.float32,
         )
+        # Propagate extra_info from reward model to applicable samples
+        if hasattr(output, 'extra_info') and output.extra_info:
+            for extra_key, extra_vals in output.extra_info.items():
+                for s, val in zip(sub_samples, extra_vals):
+                    s.extra_kwargs[extra_key] = val
         return self._scatter_with_nan_padding(sub_scores, mask, reward_name=name)
 
     def _compute_pointwise_batch(
