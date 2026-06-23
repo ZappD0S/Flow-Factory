@@ -3,6 +3,7 @@ import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import torch
 from accelerate import Accelerator
 from PIL import Image
 
@@ -10,9 +11,11 @@ from ..hparams import RewardArguments
 from ..utils.image import pil_image_to_base64
 
 # Recycle necessary components from existing reward models
+from .abc import RewardModelOutput
 from .rational_rewards_edit import (
     RationalRewardsEditRewardModel,
     _extract_score_from_block,
+    _get_condition_image,
 )
 from .rational_rewards_t2i import (
     _clip_vlm_text_for_log,
@@ -176,7 +179,7 @@ class RationalRewardsVTORewardModel(RationalRewardsEditRewardModel):
         prompt: str,
         source: Image.Image,  # Treating condition_images as Ground Truth
         edited: Image.Image,
-    ) -> float:
+    ) -> Tuple[float, Dict[str, Any]]:
         from openai import APIConnectionError, APITimeoutError, RateLimitError
 
         gt_url = pil_image_to_base64(source, format="PNG")
@@ -208,20 +211,68 @@ class RationalRewardsVTORewardModel(RationalRewardsEditRewardModel):
 
             content = completion.choices[0].message.content
             if not content or not str(content).strip():
-                return 0.0
+                return 0.0, {}
 
             try:
                 parsed = parse_scores_from_detailed_judgement_vto(str(content))
-                return aggregate_aspect_scores(
+                score = aggregate_aspect_scores(
                     parsed,
                     self.aspects,
                     supported_aspects=VTO_SUPPORTED_ASPECTS,
                 )
+                return score, {"vlm_content": str(content), "parsed_scores": parsed}
             except (TypeError, ValueError) as e:
                 logger.warning(
                     f"VTO Parse error. Reward 0.0: {e}. Output: {_clip_vlm_text_for_log(str(content))}"
                 )
-                return 0.0
+                return 0.0, {"vlm_content": str(content), "parsed_scores": {}}
 
         logger.warning(f"VTO API failed. Reward 0.0. Last error: {last_err}")
-        return 0.0
+        return 0.0, {}
+
+    async def _run_batch(
+        self,
+        prompts: List[str],
+        sources: List[Image.Image],
+        edited: List[Image.Image],
+    ) -> Tuple[List[float], List[Dict[str, Any]]]:
+        """Score a batch and return (scores, vlm_extra_infos)."""
+        async with self._async_openai_cls(
+            base_url=self.api_base_url, api_key=self.api_key
+        ) as client:
+            semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
+            results = await self._async_score_batch(
+                client, semaphore, prompts, sources, edited
+            )
+        scores = [r[0] for r in results]
+        extras = [r[1] for r in results]
+        return scores, extras
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: List[str],
+        image: Optional[List[Image.Image]] = None,
+        video: Optional[List[List[Image.Image]]] = None,
+        condition_images: Optional[List[List[Image.Image]]] = None,
+        condition_videos: Optional[List[List[List[Image.Image]]]] = None,
+        **kwargs,
+    ) -> RewardModelOutput:
+        if image is None and video is not None:
+            image = [frames[0] for frames in video]
+        if image is None:
+            raise ValueError("Either 'image' or 'video' must be provided for RationalRewardsVTORewardModel")
+        if condition_images is None:
+            raise ValueError("condition_images (source) is required for RationalRewardsVTORewardModel")
+        if len(prompt) != len(image) or len(prompt) != len(condition_images):
+            raise ValueError(
+                f"expected len(prompt)==len(image)==len(condition_images), got "
+                f"{len(prompt)}, {len(image)}, {len(condition_images)}"
+            )
+
+        source_images = [
+            _get_condition_image(c, self.source_image_index) for c in condition_images
+        ]
+        scores, vlm_infos = asyncio.run(self._run_batch(prompt, source_images, image))
+        rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
+        return RewardModelOutput(rewards=rewards, extra_info={"vlm_judgments": vlm_infos})
