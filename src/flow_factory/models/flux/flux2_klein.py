@@ -80,7 +80,9 @@ class Flux2KleinAdapter(BaseAdapter):
         super().__init__(config, accelerator)
         self.pipeline: Flux2KleinPipeline
         self.scheduler: FlowMatchEulerDiscreteSDEScheduler
-        
+
+        self.conditioning_image_indices = config.model_args.conditioning_image_indices
+
         self._has_warned_inference_fallback = False
         self._has_warned_forward_fallback = False
     
@@ -244,9 +246,20 @@ class Flux2KleinAdapter(BaseAdapter):
                 condition_image_size=condition_image_size,
             ) for imgs in images
         ]
+
+        # Determine which images to VAE-encode
+        indices = self.conditioning_image_indices
+        if indices is not None:
+            selected_condition_images_tensors = [
+                [t[i] for i in indices if 0 <= i < len(t)]
+                for t in condition_image_tensors
+            ]
+        else:
+            selected_condition_images_tensors = condition_image_tensors
+
         image_latents_list = []
         image_latent_ids_list = []
-        for cond_img_tensors in condition_image_tensors:
+        for cond_img_tensors in selected_condition_images_tensors:
             image_latents, image_latent_ids =  self.pipeline.prepare_image_latents(
                 images=cond_img_tensors,
                 batch_size=1,
