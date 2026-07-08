@@ -755,8 +755,7 @@ class LogTable:
 
             vlm_info = s.extra_kwargs.get('vlm_judgments', {})
             parsed = vlm_info.get('parsed_scores', {})
-            rewards_dict = s.extra_kwargs.get('rewards', {})
-            agg = float(rewards_dict.get('vlm_judge', float('nan')))
+            agg = vlm_info.get('aggregate_score', float('nan'))
 
             row: List[Optional[Union[LogImage, str]]] = (
                 cond_items + [None] * (n_conds - len(conds))

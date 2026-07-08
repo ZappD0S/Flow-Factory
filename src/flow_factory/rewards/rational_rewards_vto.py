@@ -220,7 +220,7 @@ class RationalRewardsVTORewardModel(RationalRewardsEditRewardModel):
                     self.aspects,
                     supported_aspects=VTO_SUPPORTED_ASPECTS,
                 )
-                return score, {"vlm_content": str(content), "parsed_scores": parsed}
+                return score, {"vlm_content": str(content), "parsed_scores": parsed, "aggregate_score": score}
             except (TypeError, ValueError) as e:
                 logger.warning(
                     f"VTO Parse error. Reward 0.0: {e}. Output: {_clip_vlm_text_for_log(str(content))}"
