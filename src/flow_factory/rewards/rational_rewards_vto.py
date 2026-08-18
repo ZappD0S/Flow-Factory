@@ -39,7 +39,7 @@ RATIONAL_VTO_SYSTEM_PROMPT = (
 )
 
 VTO_TASK_GUIDELINE = """Assess the generated image against the ground truth on four critical aspects.
-Provide justifications and absolute scores on a 1-4 scale. 
+Provide justifications and absolute scores on a 1-4 scale.
 
 **CRITICAL:** Compress your evaluations toward the center of the 1-4 scale. Avoid assigning the absolute highest (4.0) or lowest (1.0) scores. Map extreme perfection toward 3.5, and extreme failures toward 1.5.
 
@@ -220,7 +220,11 @@ class RationalRewardsVTORewardModel(RationalRewardsEditRewardModel):
                     self.aspects,
                     supported_aspects=VTO_SUPPORTED_ASPECTS,
                 )
-                return score, {"vlm_content": str(content), "parsed_scores": parsed, "aggregate_score": score}
+                return score, {
+                    "vlm_content": str(content),
+                    "parsed_scores": parsed,
+                    "aggregate_score": score,
+                }
             except (TypeError, ValueError) as e:
                 logger.warning(
                     f"VTO Parse error. Reward 0.0: {e}. Output: {_clip_vlm_text_for_log(str(content))}"
@@ -261,9 +265,13 @@ class RationalRewardsVTORewardModel(RationalRewardsEditRewardModel):
         if image is None and video is not None:
             image = [frames[0] for frames in video]
         if image is None:
-            raise ValueError("Either 'image' or 'video' must be provided for RationalRewardsVTORewardModel")
+            raise ValueError(
+                "Either 'image' or 'video' must be provided for RationalRewardsVTORewardModel"
+            )
         if condition_images is None:
-            raise ValueError("condition_images (source) is required for RationalRewardsVTORewardModel")
+            raise ValueError(
+                "condition_images (source) is required for RationalRewardsVTORewardModel"
+            )
         if len(prompt) != len(image) or len(prompt) != len(condition_images):
             raise ValueError(
                 f"expected len(prompt)==len(image)==len(condition_images), got "
@@ -275,4 +283,6 @@ class RationalRewardsVTORewardModel(RationalRewardsEditRewardModel):
         ]
         scores, vlm_infos = asyncio.run(self._run_batch(prompt, source_images, image))
         rewards = torch.tensor(scores, dtype=torch.float32, device=self.device)
-        return RewardModelOutput(rewards=rewards, extra_info={"vlm_judgments": vlm_infos})
+        return RewardModelOutput(
+            rewards=rewards, extra_info={"vlm_judgments": vlm_infos}
+        )
