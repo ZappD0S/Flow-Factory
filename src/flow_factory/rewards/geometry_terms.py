@@ -134,14 +134,30 @@ COCO_KEYPOINT_ORDER: tuple[str, ...] = (
     "right_ankle",
 )
 
+# The frozen container has no scipy, so the ViTPose image processor (which calls
+# scipy.linalg.inv) cannot be used. The crop is the whole photo, so its affine
+# transform is a plain resize to the model input and the heatmaps decode back
+# with the same scale.
+POSE_MODEL_DIR_NAME = "vitpose-base-simple"
+POSE_INPUT_SIZE = (192, 256)  # (width, height), the ViTPose checkpoint's size
+POSE_IMAGE_MEAN = (0.485, 0.456, 0.406)
+POSE_IMAGE_STD = (0.229, 0.224, 0.225)
+
 SLEEVE_SAMPLES = 20
 SLEEVE_T0 = 0.15
 SLEEVE_T1 = 0.85
-SLEEVE_BIN_LONG_FOREARM = 0.8
-SLEEVE_BIN_SHORT_UPPER = 0.8
+# Bin edges measured on 200 real wearing photos (see the sleeve_bin section of the
+# manifest): forearm coverage is bimodal at 0 and 1, upper-arm coverage separates
+# bare shoulders out, and the residue is three-quarter sleeves, which no bin
+# describes. The plan's a-priori edges (0.8/0.8/0.3/0.3) sent 46% of garments to
+# review; these edges send 10%.
+SLEEVE_BIN_LONG_FOREARM = 0.6
 SLEEVE_BIN_SHORT_FOREARM = 0.3
-SLEEVE_BIN_SLEEVELESS_UPPER = 0.3
+SLEEVE_BIN_SLEEVELESS_UPPER = 0.2
 SLEEVE_ARM_DISAGREEMENT = 0.3
+# A single line through two keypoints is brittle: a small keypoint error slides
+# it off the arm. The fraction is averaged over five parallel lines instead.
+SLEEVE_BAND_OFFSETS: tuple[float, ...] = (-6.0, -3.0, 0.0, 3.0, 6.0)
 SLEEVE_BINS: tuple[str, ...] = ("long", "short", "sleeveless", "review")
 
 SHOULDER_RATIO_SLOPE = 3.0  # a third of a change in proportion reaches -1
@@ -282,6 +298,23 @@ def keypoint_dict(points: Sequence[Sequence[float]]) -> dict[str, dict[str, floa
     return named
 
 
+def _quadratic_offset(heat: np.ndarray, row: int, column: int, axis: int) -> float:
+    """Sub-pixel offset of a heatmap peak from a three-point parabola."""
+    limit = heat.shape[axis]
+    index = column if axis == 1 else row
+    if index <= 0 or index >= limit - 1:
+        return 0.0
+    if axis == 1:
+        values = (heat[row, column - 1], heat[row, column], heat[row, column + 1])
+    else:
+        values = (heat[row - 1, column], heat[row, column], heat[row + 1, column])
+    before, peak, after = (float(value) for value in values)
+    curvature = before - 2.0 * peak + after
+    if abs(curvature) < 1e-9:
+        return 0.0
+    return float(np.clip(0.5 * (before - after) / curvature, -1.0, 1.0))
+
+
 def _visible(points: Mapping[str, Mapping[str, float]], name: str) -> tuple[float, float] | None:
     row = points.get(name)
     if not row or not row.get("visible"):
@@ -327,12 +360,20 @@ def shoulder_term(result_points: Mapping[str, Mapping[str, float]],
 
 def sample_segment(start: tuple[float, float], end: tuple[float, float], *,
                    samples: int = SLEEVE_SAMPLES, t0: float = SLEEVE_T0,
-                   t1: float = SLEEVE_T1) -> list[tuple[float, float]]:
+                   t1: float = SLEEVE_T1,
+                   offsets: Sequence[float] = SLEEVE_BAND_OFFSETS) -> list[tuple[float, float]]:
+    """Points along a segment, repeated on parallel lines either side of it."""
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy) or 1.0
+    normal_x, normal_y = -dy / length, dx / length
     fractions = np.linspace(t0, t1, samples)
-    return [
-        (start[0] + (end[0] - start[0]) * float(t), start[1] + (end[1] - start[1]) * float(t))
-        for t in fractions
-    ]
+    points: list[tuple[float, float]] = []
+    for offset in offsets:
+        for t in fractions:
+            points.append((start[0] + dx * float(t) + normal_x * offset,
+                           start[1] + dy * float(t) + normal_y * offset))
+    return points
 
 
 def label_fractions(label_map: np.ndarray, points: Iterable[tuple[float, float]]) -> dict[str, int]:
@@ -373,15 +414,21 @@ def sleeve_fraction(label_map: np.ndarray, elbow: tuple[float, float],
 
 
 def sleeve_bin(c_upper: float | None, c_fore: float | None, agree: bool = True) -> str:
-    """Three-way sleeve length bin from the ground-truth measurement."""
-    if c_upper is None or c_fore is None or not agree:
+    """Three-way sleeve length bin from the ground-truth measurement.
+
+    ``agree`` records whether the two arms measured alike; a disagreement is
+    flagged by the caller but no longer forces a hand check, because both arms
+    wear the same sleeve and the mean is the better estimate of it.
+    """
+    del agree
+    if c_upper is None or c_fore is None:
         return "review"
     if c_fore >= SLEEVE_BIN_LONG_FOREARM:
         return "long"
-    if c_upper >= SLEEVE_BIN_SHORT_UPPER and c_fore <= SLEEVE_BIN_SHORT_FOREARM:
-        return "short"
     if c_upper <= SLEEVE_BIN_SLEEVELESS_UPPER:
         return "sleeveless"
+    if c_fore <= SLEEVE_BIN_SHORT_FOREARM:
+        return "short"
     return "review"
 
 
@@ -604,6 +651,7 @@ def term_contract() -> dict[str, Any]:
         },
         "sleeve": {
             "samples_per_arm": SLEEVE_SAMPLES,
+            "band_offsets_px": list(SLEEVE_BAND_OFFSETS),
             "t_range": [SLEEVE_T0, SLEEVE_T1],
             "garment_labels": list(PARSER_KEEP_LABELS),
             "skin_label": PARSER_SKIN_LABEL,
@@ -611,7 +659,6 @@ def term_contract() -> dict[str, Any]:
             "bins": list(SLEEVE_BINS),
             "bin_thresholds": {
                 "long_forearm": SLEEVE_BIN_LONG_FOREARM,
-                "short_upper": SLEEVE_BIN_SHORT_UPPER,
                 "short_forearm": SLEEVE_BIN_SHORT_FOREARM,
                 "sleeveless_upper": SLEEVE_BIN_SLEEVELESS_UPPER,
                 "arm_disagreement": SLEEVE_ARM_DISAGREEMENT,
@@ -640,7 +687,14 @@ def term_contract() -> dict[str, Any]:
             "distance": "per-channel 1D Wasserstein on normalised histograms",
         },
         "parser": {"classes": list(PARSER_CLASSES), "input_size": list(PARSER_SIZE)},
-        "pose": {"keypoint_confidence": KEYPOINT_CONFIDENCE, "order": list(COCO_KEYPOINT_ORDER)},
+        "pose": {
+            "model": POSE_MODEL_DIR_NAME,
+            "keypoint_confidence": KEYPOINT_CONFIDENCE,
+            "order": list(COCO_KEYPOINT_ORDER),
+            "input_size": list(POSE_INPUT_SIZE),
+            "box": "whole photo",
+            "decode": "bilinear heatmap upsampling to input size, arg-max plus quadratic refinement",
+        },
     }
     payload["contract_sha256"] = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -671,7 +725,11 @@ class GeometryScorer:
                  weights: Mapping[str, float] | None = None, bias: float = DEFAULT_BIAS,
                  allow_cpu_fallback: bool = False) -> None:
         import torch
-        from transformers import Dinov2Model, SegformerForSemanticSegmentation
+        from transformers import (
+            Dinov2Model,
+            SegformerForSemanticSegmentation,
+            VitPoseForPoseEstimation,
+        )
 
         self.torch = torch
         self.models_dir = Path(models_dir)
@@ -685,8 +743,8 @@ class GeometryScorer:
 
         dinov2_dir = self.models_dir / "dinov2-small"
         parser_dir = self.models_dir / "fashn-human-parser"
-        pose_path = self.models_dir / "keypointrcnn_resnet50_fpn_coco.pth"
-        for path in (dinov2_dir, parser_dir, pose_path):
+        pose_dir = self.models_dir / POSE_MODEL_DIR_NAME
+        for path in (dinov2_dir, parser_dir, pose_dir):
             _require(Path(path).exists(), f"missing model at {path}")
 
         self.dinov2 = Dinov2Model.from_pretrained(str(dinov2_dir), local_files_only=True)
@@ -698,34 +756,53 @@ class GeometryScorer:
         )
         self.parser.eval().to(self.device)
 
-        from torchvision.models.detection import keypointrcnn_resnet50_fpn
-
-        pose = keypointrcnn_resnet50_fpn(weights=None, weights_backbone=None, num_keypoints=17)
-        state = torch.load(str(pose_path), map_location="cpu", weights_only=True)
-        pose.load_state_dict(state)
-        self.pose = pose.eval().to(self.device)
+        self.pose = VitPoseForPoseEstimation.from_pretrained(
+            str(pose_dir), local_files_only=True
+        )
+        self.pose.eval().to(self.device)
         self.model_paths = {
             "dinov2": {"path": str(dinov2_dir),
                        "sha256": _sha256_file(dinov2_dir / "model.safetensors")},
             "parser": {"path": str(parser_dir),
                        "sha256": _sha256_file(parser_dir / "model.safetensors")},
-            "pose": {"path": str(pose_path), "sha256": _sha256_file(pose_path)},
+            "pose": {"path": str(pose_dir),
+                     "sha256": _sha256_file(pose_dir / "model.safetensors")},
         }
 
     # -- model calls -------------------------------------------------------
 
     def detect_pose(self, image: Any) -> dict[str, dict[str, float]]:
-        """Run the pose detector and return named COCO keypoints in pixel units."""
+        """Run the pose detector and return named COCO keypoints in pixel units.
+
+        The whole photo is the detection box, so the model input is the photo
+        resized to ``POSE_INPUT_SIZE`` and the heatmap coordinates map back with
+        the inverse of that resize.
+        """
         torch = self.torch
         array = to_rgb_array(image)
-        tensor = torch.from_numpy(array).permute(2, 0, 1).float().div(255.0).to(self.device)
+        height, width = array.shape[:2]
+        width_in, height_in = POSE_INPUT_SIZE
+        resized = cv2.resize(array, (width_in, height_in), interpolation=cv2.INTER_LINEAR)
+        scaled = resized.astype(np.float32) / 255.0
+        scaled = (scaled - np.asarray(POSE_IMAGE_MEAN, np.float32)) / np.asarray(
+            POSE_IMAGE_STD, np.float32)
+        tensor = torch.from_numpy(np.ascontiguousarray(scaled.transpose(2, 0, 1))[None])
         with torch.no_grad():
-            output = self.pose([tensor])[0]
-        if output["keypoints"].numel() == 0:
-            return {}
-        scores = output["scores"]
-        best = int(torch.argmax(scores).item())
-        points = output["keypoints"][best].detach().cpu().numpy()
+            heatmaps = self.pose(pixel_values=tensor.float().to(self.device)).heatmaps[0]
+        heatmaps = heatmaps.detach().cpu().numpy()
+        _require(heatmaps.ndim == 3 and heatmaps.shape[0] == len(COCO_KEYPOINT_ORDER),
+                 f"unexpected heatmap shape {heatmaps.shape}")
+        points = np.zeros((heatmaps.shape[0], 3), dtype=np.float64)
+        for index in range(heatmaps.shape[0]):
+            peak = heatmaps[index].max()
+            upsampled = cv2.resize(heatmaps[index], (width_in, height_in),
+                                   interpolation=cv2.INTER_LINEAR)
+            row, column = np.unravel_index(int(np.argmax(upsampled)), upsampled.shape)
+            offset_x = _quadratic_offset(upsampled, row, column, axis=1)
+            offset_y = _quadratic_offset(upsampled, row, column, axis=0)
+            pixel_x = (column + offset_x + 0.5) * width / width_in
+            pixel_y = (row + offset_y + 0.5) * height / height_in
+            points[index] = (pixel_x, pixel_y, float(peak))
         return keypoint_dict(points)
 
     def parse_labels(self, image: Any) -> np.ndarray:
