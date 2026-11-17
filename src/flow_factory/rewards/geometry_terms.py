@@ -299,6 +299,54 @@ def _require(condition: bool, message: str) -> None:
 # ------------------------------------------------------------------- primitives
 
 
+def frame_shape(image: Any) -> tuple[int, int]:
+    """``(height, width)`` of a picture, without decoding its pixels twice.
+
+    A person photo and its edited result routinely have different resolutions -- the
+    graded set is 1024 by 768 against 768 by 576 -- and keypoints live in the resolution
+    they were detected at. Reading the frame size is the first half of putting the two
+    sets of keypoints back into one frame.
+    """
+    size = getattr(image, "size", None)
+    if isinstance(size, tuple) and len(size) == 2 and all(isinstance(v, int) for v in size):
+        return (int(size[1]), int(size[0]))
+    if isinstance(image, (str, Path)):
+        with Image.open(image) as handle:
+            return (int(handle.size[1]), int(handle.size[0]))
+    array = np.asarray(image)
+    _require(array.ndim >= 2, "expected a picture to read a frame from")
+    return (int(array.shape[0]), int(array.shape[1]))
+
+
+def scale_points_to_frame(points: Mapping[str, Mapping[str, float]],
+                          source: tuple[int, int],
+                          target: tuple[int, int]) -> dict[str, dict[str, float]]:
+    """Move keypoints from one frame's resolution onto another's, in place of a copy.
+
+    The person-anchored shoulder ratio divides an absolute width by an absolute width, so
+    it is only meaningful when both widths are measured in the same pixels. Comparing a
+    person pose detected at 1024 by 768 against a result at 768 by 576 moves the hip
+    midpoint by roughly a quarter of the frame and makes the pelvis gate refuse every
+    candidate, which reads as a failed pose check rather than as a unit mismatch.
+    """
+    source_height, source_width = (int(source[0]), int(source[1]))
+    target_height, target_width = (int(target[0]), int(target[1]))
+    _require(source_height > 0 and source_width > 0, "source frame is empty")
+    scale_y = target_height / float(source_height)
+    scale_x = target_width / float(source_width)
+    if scale_x == 1.0 and scale_y == 1.0:
+        return {name: dict(point) for name, point in points.items()}
+    scaled: dict[str, dict[str, float]] = {}
+    for name, point in points.items():
+        moved = dict(point)
+        if "x" in moved:
+            moved["x"] = float(moved["x"]) * scale_x
+        if "y" in moved:
+            moved["y"] = float(moved["y"]) * scale_y
+        scaled[name] = moved
+    return scaled
+
+
 def to_rgb_array(image: Any, *, size: tuple[int, int] | None = None) -> np.ndarray:
     """Return a uint8 RGB numpy array from a PIL image, a path or an array."""
     if isinstance(image, (str, Path)):
@@ -1663,7 +1711,12 @@ class GeometryScorer:
                      person_available: bool = True) -> dict[str, Any]:
         """Compute the five terms and the combined score for one candidate."""
         result_array = to_rgb_array(result)
+        person_frame = frame_shape(person)
         person_array = to_rgb_array(person, size=(result_array.shape[1], result_array.shape[0]))
+        # The person was resized onto the result's pixel grid, so its keypoints have to be
+        # moved the same way; otherwise every person-against-result comparison mixes units.
+        person_points = scale_points_to_frame(
+            person_points, person_frame, (result_array.shape[0], result_array.shape[1]))
         garment_array = to_rgb_array(garment)
         if changed_mask.shape != result_array.shape[:2]:
             changed_mask = cv2.resize(
