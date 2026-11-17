@@ -160,7 +160,12 @@ SLEEVE_ARM_DISAGREEMENT = 0.3
 SLEEVE_BAND_OFFSETS: tuple[float, ...] = (-6.0, -3.0, 0.0, 3.0, 6.0)
 SLEEVE_BINS: tuple[str, ...] = ("long", "short", "sleeveless", "review")
 
-SHOULDER_RATIO_SLOPE = 3.0  # a third of a change in proportion reaches -1
+# A half again as wide or half as wide reaches the floor. Measured on the 160
+# graded candidates, the ratio spans 0.90 to 1.54, so a slope of 3 clamped 12 of
+# them for no extra ranking power: every slope from 0.75 to 2 orders the grades
+# identically (AUROC 0.722), while 3 clamps 12 candidates and 6 clamps 39 and
+# loses ordering (0.685).
+SHOULDER_RATIO_SLOPE = 2.0
 # Three rulers, tried in this order; each is also reported as a non-scoring
 # variant so the order is a measured claim. The head ruler (neck midpoint to nose)
 # is the oldest and the worst: the nose is a face keypoint, the pose detector
