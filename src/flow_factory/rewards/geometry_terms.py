@@ -161,6 +161,13 @@ SLEEVE_BAND_OFFSETS: tuple[float, ...] = (-6.0, -3.0, 0.0, 3.0, 6.0)
 SLEEVE_BINS: tuple[str, ...] = ("long", "short", "sleeveless", "review")
 
 SHOULDER_RATIO_SLOPE = 3.0  # a third of a change in proportion reaches -1
+# Two rulers, tried in this order. The head ruler (neck midpoint to nose) is the
+# cheapest, but the nose is a face keypoint and the pose detector slides it on
+# generated faces: on the 160 graded pictures it drove the ratio far enough to
+# pin 57% of the candidates at the -1 floor. Hip width is a body keypoint on the
+# same person, moves with the silhouette rather than the face, and is unchanged by
+# an upper-body edit, so it is preferred whenever both frames have both hips.
+SHOULDER_RULERS: tuple[str, ...] = ("hips", "head")
 
 
 class GeometryTermError(RuntimeError):
@@ -322,20 +329,33 @@ def _visible(points: Mapping[str, Mapping[str, float]], name: str) -> tuple[floa
     return float(row["x"]), float(row["y"])
 
 
-def pose_ratio(points: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    """Scale-free shoulder ratio using the head as a built-in ruler.
+def pose_ratio(points: Mapping[str, Mapping[str, float]],
+               ruler: str = "head") -> dict[str, Any]:
+    """Scale-free shoulder ratio against a built-in ruler.
 
-    The ruler is the distance from the midpoint of the two shoulders to the nose,
-    so zoom, crop and translation cancel out. Both operands must come from the same
+    ``ruler="hips"`` divides the shoulder width by the hip width, ``ruler="head"``
+    by the distance from the midpoint of the two shoulders to the nose. Either way
+    zoom, crop and translation cancel out. Both operands must come from the same
     detector: the person ratio is cached by ``prepare_t018_geometry.py`` from a run
     of the same detector on the person photo.
     """
     left = _visible(points, "left_shoulder")
     right = _visible(points, "right_shoulder")
-    nose = _visible(points, "nose")
-    if left is None or right is None or nose is None:
-        return {"ratio": None, "ruler": None, "reason": "missing_shoulder_or_nose"}
+    if left is None or right is None:
+        return {"ratio": None, "ruler": None, "reason": "missing_shoulders"}
     shoulder = math.dist(left, right)
+    if ruler == "hips":
+        left_hip = _visible(points, "left_hip")
+        right_hip = _visible(points, "right_hip")
+        if left_hip is None or right_hip is None:
+            return {"ratio": None, "ruler": None, "reason": "missing_hips"}
+        width = math.dist(left_hip, right_hip)
+        if shoulder <= 0 or width <= 1e-6:
+            return {"ratio": None, "ruler": None, "reason": "degenerate_ruler"}
+        return {"ratio": shoulder / width, "ruler": "shoulder_over_hip", "reason": ""}
+    nose = _visible(points, "nose")
+    if nose is None:
+        return {"ratio": None, "ruler": None, "reason": "missing_nose"}
     neck = ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
     head = math.dist(neck, nose)
     if shoulder <= 0 or head <= 1e-6:
@@ -344,18 +364,46 @@ def pose_ratio(points: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
 
 
 def shoulder_term(result_points: Mapping[str, Mapping[str, float]],
-                  person_points: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    """Proportion change of shoulder width, in [-1, 0]."""
-    result_ratio = pose_ratio(result_points)
-    person_ratio = pose_ratio(person_points)
-    if result_ratio["ratio"] is None or person_ratio["ratio"] is None:
+                  person_points: Mapping[str, Mapping[str, float]],
+                  ruler: str | None = None) -> dict[str, Any]:
+    """Proportion change of shoulder width, in [-1, 0].
+
+    Every ruler is measured on both frames; ``variants`` keeps all of them so the
+    offline report can show what each one would have scored. ``ruler=None`` picks
+    the first usable entry of ``SHOULDER_RULERS``; naming a ruler forces it and
+    makes the term unmeasurable when that ruler alone is unavailable.
+    """
+    variants: dict[str, dict[str, Any]] = {}
+    for name in SHOULDER_RULERS:
+        result_ratio = pose_ratio(result_points, name)
+        person_ratio = pose_ratio(person_points, name)
+        entry: dict[str, Any] = {
+            "ruler": result_ratio["ruler"] or person_ratio["ruler"],
+            "result_ratio": result_ratio["ratio"],
+            "person_ratio": person_ratio["ratio"],
+            "available": False,
+            "relative": None,
+            "value": None,
+            "reason": result_ratio["reason"] or person_ratio["reason"],
+        }
+        if entry["result_ratio"] is not None and entry["person_ratio"] is not None:
+            relative = entry["result_ratio"] / entry["person_ratio"]
+            entry["relative"] = float(relative)
+            entry["value"] = float(-min(1.0, SHOULDER_RATIO_SLOPE * abs(relative - 1.0)))
+            entry["available"] = True
+        variants[name] = entry
+
+    order = (ruler,) if ruler is not None else SHOULDER_RULERS
+    chosen = next((name for name in order if variants[name]["available"]), None)
+    if chosen is None:
         return {"value": WORST_VALUE["shoulder"], "flag": "shoulder_unmeasurable",
-                "result_ratio": result_ratio["ratio"], "person_ratio": person_ratio["ratio"],
-                "ruler": result_ratio["ruler"] or person_ratio["ruler"]}
-    relative = result_ratio["ratio"] / person_ratio["ratio"]
-    value = -min(1.0, SHOULDER_RATIO_SLOPE * abs(relative - 1.0))
-    return {"value": float(value), "flag": "", "result_ratio": result_ratio["ratio"],
-            "person_ratio": person_ratio["ratio"], "ruler": result_ratio["ruler"]}
+                "ruler": None, "result_ratio": None, "person_ratio": None,
+                "relative": None, "saturated": True, "variants": variants}
+    entry = variants[chosen]
+    return {"value": entry["value"], "flag": "", "ruler": entry["ruler"],
+            "ruler_name": chosen, "result_ratio": entry["result_ratio"],
+            "person_ratio": entry["person_ratio"], "relative": entry["relative"],
+            "saturated": entry["value"] <= -1.0, "variants": variants}
 
 
 def sample_segment(start: tuple[float, float], end: tuple[float, float], *,
@@ -400,7 +448,7 @@ def label_fractions(label_map: np.ndarray, points: Iterable[tuple[float, float]]
 
 def sleeve_fraction(label_map: np.ndarray, elbow: tuple[float, float],
                     wrist: tuple[float, float]) -> dict[str, Any]:
-    """Share of the forearm covered by the garment (or by skin for a long sleeve)."""
+    """Share of one arm segment covered by garment, skin, dropped labels or other."""
     counts = label_fractions(label_map, sample_segment(elbow, wrist))
     counted = counts["garment"] + counts["skin"]
     if counted == 0:
@@ -432,20 +480,48 @@ def sleeve_bin(c_upper: float | None, c_fore: float | None, agree: bool = True) 
     return "review"
 
 
+def _sleeve_value(penalty: float) -> float:
+    range_size = TERM_RANGES["sleeve"][1] - TERM_RANGES["sleeve"][0]
+    return float(TERM_RANGES["sleeve"][1] - range_size * min(max(penalty, 0.0), 1.0))
+
+
 def sleeve_term(result_points: Mapping[str, Mapping[str, float]], label_map: np.ndarray,
-                bin_label: str, person_points: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    """Forearm coverage defect, in [-1, 0], never missing."""
+                bin_label: str, person_points: Mapping[str, Mapping[str, float]],
+                expected: Mapping[str, float | None] | None = None) -> dict[str, Any]:
+    """Arm coverage defect, in [-1, 0], never missing.
+
+    The upper arm (shoulder to elbow) is measured as well as the forearm (elbow to
+    wrist). Previously only the forearm was scored, so a garment whose sleeve
+    vanished above the elbow while the forearm stayed bare produced no penalty at
+    all: the bin rule never looked there.
+
+    ``expected`` carries the garment's own coverage, measured on the wearing photo
+    by ``ground_truth_sleeve``: ``{"upper": c_upper, "fore": c_fore}``. When both
+    segments can be compared, the penalty is the mean shortfall against that
+    profile, and the bin no longer gates the score -- that matters because the
+    ``review`` bin (three-quarter sleeves) covers 30% of the graded candidates and
+    used to return exactly 0.0. Without ``expected`` the term falls back to the old
+    bin rule, one segment per bin.
+    """
     _require(bin_label in SLEEVE_BINS, f"unknown sleeve bin: {bin_label}")
     per_arm: list[dict[str, Any]] = []
     for side in ("left", "right"):
+        shoulder = _visible(result_points, f"{side}_shoulder")
         elbow = _visible(result_points, f"{side}_elbow")
         wrist = _visible(result_points, f"{side}_wrist")
         if elbow is None or wrist is None:
             continue
-        measured = sleeve_fraction(label_map, elbow, wrist)
-        if measured["garment_fraction"] is None:
+        forearm = sleeve_fraction(label_map, elbow, wrist)
+        if forearm["garment_fraction"] is None:
             continue
-        per_arm.append({"side": side, **measured})
+        upper_arm = sleeve_fraction(label_map, shoulder, elbow) if shoulder else {
+            "garment_fraction": None, "skin_fraction": None}
+        per_arm.append({
+            "side": side,
+            **forearm,
+            "upper_garment_fraction": upper_arm["garment_fraction"],
+            "upper_skin_fraction": upper_arm["skin_fraction"],
+        })
     person_arms = sum(
         _visible(person_points, f"{side}_elbow") is not None
         and _visible(person_points, f"{side}_wrist") is not None
@@ -457,16 +533,58 @@ def sleeve_term(result_points: Mapping[str, Mapping[str, float]], label_map: np.
         # Broken pose inside the shirt is a defect; a person photo with no visible
         # arms means nothing could have been destroyed.
         value = WORST_VALUE["sleeve"] if person_arms >= 2 else 0.0
-        return {"value": float(value), "flag": "sleeve_missing", **detail}
+        return {"value": float(value), "flag": "sleeve_missing", "mode": "missing", **detail}
+
+    upper_values = [arm["upper_garment_fraction"] for arm in per_arm
+                    if arm["upper_garment_fraction"] is not None]
+    measured = {
+        "upper": float(np.mean(upper_values)) if upper_values else None,
+        "fore": float(np.mean([arm["garment_fraction"] for arm in per_arm])),
+    }
+    forecasted = {
+        segment: None if expected is None else _expected_coverage(expected, segment)
+        for segment in ("upper", "fore")
+    }
+    deficit = {
+        segment: max(0.0, float(target) - float(measured[segment]))
+        for segment, target in forecasted.items()
+        if target is not None and measured[segment] is not None
+    }
+    bin_penalty = _bin_penalty(per_arm, bin_label)
+    bin_value = 0.0 if bin_label == "review" else _sleeve_value(bin_penalty)
+    detail.update({"measured": measured, "expected": forecasted, "deficit": deficit,
+                   "bin_penalty": bin_penalty, "bin_value": bin_value})
+
+    if deficit:
+        penalty = float(np.mean(list(deficit.values())))
+        detail.update({"mode": "coverage_profile", "penalty": penalty})
+        flag = "sleeve_bin_review" if bin_label == "review" else ""
+        return {"value": _sleeve_value(penalty), "flag": flag, **detail}
+
+    detail.update({"mode": "bin", "penalty": bin_penalty})
     if bin_label == "review":
         return {"value": 0.0, "flag": "sleeve_bin_review", **detail}
+    return {"value": bin_value, "flag": "", **detail}
+
+
+def _expected_coverage(expected: Mapping[str, float | None], segment: str) -> float | None:
+    """Read one segment of the garment profile, accepting either key spelling.
+
+    ``ground_truth_sleeve`` returns ``c_upper`` and ``c_fore``; the geometry cache
+    and the evaluator carry ``upper`` and ``fore``.
+    """
+    for key in (segment, f"c_{segment}"):
+        value = expected.get(key)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _bin_penalty(per_arm: Sequence[Mapping[str, Any]], bin_label: str) -> float:
+    """Old rule: what must not be seen on the forearm, given the garment's length."""
     if bin_label == "long":
-        penalty = float(np.mean([arm["skin_fraction"] for arm in per_arm]))
-    else:
-        penalty = float(np.mean([arm["garment_fraction"] for arm in per_arm]))
-    range_size = TERM_RANGES["sleeve"][1] - TERM_RANGES["sleeve"][0]
-    value = TERM_RANGES["sleeve"][1] - range_size * min(max(penalty, 0.0), 1.0)
-    return {"value": float(value), "flag": "", "penalty": penalty, **detail}
+        return float(np.mean([arm["skin_fraction"] for arm in per_arm]))
+    return float(np.mean([arm["garment_fraction"] for arm in per_arm]))
 
 
 def ground_truth_sleeve(label_map: np.ndarray,
@@ -646,7 +764,12 @@ def term_contract() -> dict[str, Any]:
             "expected_area_share": list(MASK_AREA_RANGE),
         },
         "shoulder": {
-            "ruler": "euclidean(left_shoulder, right_shoulder) / euclidean(mid_shoulder, nose)",
+            "rulers_in_order": [
+                "euclidean(left_shoulder, right_shoulder) / euclidean(left_hip, right_hip)",
+                "euclidean(left_shoulder, right_shoulder) / euclidean(mid_shoulder, nose)",
+            ],
+            "ruler_policy": "hip width when both frames show both hips, else neck-to-nose; "
+                            "every ruler is also reported as a non-scoring variant",
             "penalty": f"-min(1, {SHOULDER_RATIO_SLOPE} * |result/person - 1|)",
         },
         "sleeve": {
@@ -663,7 +786,13 @@ def term_contract() -> dict[str, Any]:
                 "sleeveless_upper": SLEEVE_BIN_SLEEVELESS_UPPER,
                 "arm_disagreement": SLEEVE_ARM_DISAGREEMENT,
             },
+            "segments": ["shoulder_to_elbow", "elbow_to_wrist"],
+            "simplified_rule": "mean shortfall of measured garment coverage below the garment's own "
+                               "upper-arm and forearm coverage; falls back to the forearm-only bin rule",
+            "uses_bin_as_gate": False,
             "missing_value": "worst when the person photo had two visible arms, 0 otherwise",
+            "review_bin_value": "measured, not 0.0",
+            "upper_arm_gap": "measured since T018 repair; the bin rule ignores the upper arm entirely",
         },
         "keep": {
             "ssim_window": SSIM_WINDOW,
@@ -850,6 +979,7 @@ class GeometryScorer:
     def score_sample(self, *, result: Any, person: Any, garment: Any,
                      changed_mask: np.ndarray, cloth_mask: np.ndarray,
                      sleeve_bin_label: str, person_points: Mapping[str, Mapping[str, float]],
+                     sleeve_expected: Mapping[str, float | None] | None = None,
                      person_available: bool = True) -> dict[str, Any]:
         """Compute the five terms and the combined score for one candidate."""
         result_array = to_rgb_array(result)
@@ -866,7 +996,8 @@ class GeometryScorer:
         shoulder = shoulder_term(result_points, person_points) if result_points else {
             "value": WORST_VALUE["shoulder"], "flag": "shoulder_unmeasurable",
             "result_ratio": None, "person_ratio": pose_ratio(person_points)["ratio"], "ruler": None}
-        sleeve = sleeve_term(result_points, labels, sleeve_bin_label, person_points)
+        sleeve = sleeve_term(result_points, labels, sleeve_bin_label, person_points,
+                             expected=sleeve_expected)
 
         garment_region = np.isin(labels, PARSER_KEEP_LABELS)
         eroded = erode_mask(garment_region, 2 * PATCH_SIZE + 1)
