@@ -74,12 +74,31 @@ MASK_AREA_RANGE = (0.20, 0.75)  # sanity band on the share of the frame that may
 # Structural similarity, computed on the whole frame and masked afterwards.
 SSIM_WINDOW = 11
 SSIM_SIGMA = 1.5
+# Every SSIM value is an 11 by 11 window average, so a kept pixel whose window still
+# contains changed pixels reports the edit as a loss of structure. The changed-area mask
+# is grown by less than this radius, so the kept mask is eroded by the full support
+# radius before its SSIM is averaged.
+SSIM_SUPPORT_RADIUS = SSIM_WINDOW // 2
 # A mean CIE76 difference of this size is worth nothing, and the product form means a
 # recoloured picture cannot buy its score back with structure. 25 is roughly "same
 # object, different colour": a full hue rotation of a saturated garment lands far
 # above it, so the hue-rotation ladder case reads 0.0 instead of the 0.70 ceiling the
 # old additive 0.7 * SSIM + 0.3 * (1 - L1) could not go below.
 KEEP_DELTA_E_MAX = 25.0
+
+# A patch match on frozen DINOv2 tokens compares shape and print, and the final block is
+# trained to ignore the very detail that separates a metal fabric from a flat grey one:
+# panel-20 kept +0.698 with the sparkle smoothed away. Part of the term is spent on the
+# high-frequency content of the aligned masked crops instead, at no model cost.
+GARMENT_STRUCTURE_WEIGHT = 0.7
+GARMENT_TEXTURE_WEIGHT = 0.3
+TEXTURE_HIST_BINS = 16
+TEXTURE_STD_WINDOW = 5
+# Both texture channels are scaled onto the 0..255 axis the colour histograms already use,
+# so one Wasserstein helper serves all three. A 3 by 3 Sobel reaches 4 * 255 per axis, so
+# its magnitude tops out at 4 * 255 * sqrt(2); a luminance standard deviation at 255 / 2.
+TEXTURE_GRADIENT_TO_255 = 1.0 / (4.0 * math.sqrt(2.0))
+TEXTURE_STD_TO_255 = 2.0
 
 # DINOv2 ViT-S/14 patch grid: 28 by 28 patches of 14 pixels. Both garment views are
 # letterboxed onto one square canvas, so a patch centre normalised by the grid is the
@@ -100,7 +119,22 @@ GARMENT_POSITION_PENALTY = 1.0
 GARMENT_LAYER_WEIGHT = 0.7
 GARMENT_QUADRANT_WEIGHT = 0.3
 GARMENT_QUADRANT_GRID = 2
+# The labels the ground-truth sleeve profiles were measured with, by
+# ``prepare_t018_geometry.py``. The scarf rides along because it lies over the shoulder,
+# and the cached profiles cannot be re-measured without re-running that script, so this
+# tuple stays as it was even though the worn garment mask below no longer uses it.
 PARSER_KEEP_LABELS: tuple[int, ...] = (3, 4, 10)  # top, dress, scarf
+# Patch 2: the parser splits one top between ``upper_clothes`` and ``dress``, so a union
+# of the two is the smallest set that keeps a top in one piece, and the scarf is not a
+# garment. The union alone still swallows a skirt the parser calls a dress (panel-12), so
+# it is intersected with the edited area.
+WORN_MASK_GARMENT_LABELS: tuple[int, ...] = (3, 4)  # top, dress
+# "Minus face, hair, skin/arms, hands and background" of the spec. On a single-label map
+# this subtracts nothing -- a pixel carries one class -- and it is written out anyway so
+# the mask stays correct if an overlaid or multi-label segmentation is ever fed in.
+WORN_MASK_EXCLUDED_LABELS: tuple[int, ...] = (0, 1, 2, 12, 13)  # bg, face, hair, arms, hands
+WORN_MASK_SKIRT_LABELS: tuple[int, ...] = (5, 6)  # skirt, pants: reported bleed, never kept
+WORN_MASK_EDIT_DILATE = 5
 PARSER_SKIN_LABEL = 12  # arms
 PARSER_DROPPED_LABELS: tuple[int, ...] = (13, 17)  # hands, jewelry
 PARSER_SIZE = (384, 576)  # (width, height) matching the parser's training input
@@ -142,7 +176,17 @@ COLOUR_MIN_STRIP_PIXELS = 20
 # monotone rescaling, so it cannot change a ranking; the Phase 1 evaluator run
 # refits it on the labelled set so the term's interquartile range spans at least
 # [0.4, 0.9], and only the spread, not the AUROC, moves.
-COLOUR_ALPHA = 20.0
+#
+# Patch 6: no alpha fixes that a plain exp(-alpha * D) is anchored at zero. Matching the
+# 0.02..0.05 band onto [0.9, 0.35] needs alpha ~ 36, which sends a clean D = 0.02 to 0.48
+# instead of 0.9. The shifted form clip(exp(-alpha * (D - D_ref)), 0, 1) is anchored where
+# real pairs live, so the placeholder below puts D = 0.02 at 0.90 and D = 0.05 at 0.35.
+# Calibration rule, to be applied to the dev set by the Phase 0 run: D_ref is its 5th
+# percentile of D (so an exact match maps to 1.0) and alpha = log(3) / (p95 - p5) (so the
+# typical spread covers [1.0, 1/3]). The pair (0.0167, 31.5) is that same pair read
+# backwards: p5 = 0.0167 and p95 = 0.0167 + log(3) / 31.5 = 0.0516.
+COLOUR_ALPHA = 31.5
+COLOUR_REFERENCE_DISTANCE = 0.0167
 
 # Pose: COCO keypoint order produced by the container's pose detector.
 KEYPOINT_CONFIDENCE = 0.3
@@ -221,6 +265,26 @@ SHOULDER_TARGET_RATIO = 1.0
 # (shoulder midpoint to hip midpoint) is vertical, so width changes move one operand
 # only, and it never reads the face.
 SHOULDER_RULERS: tuple[str, ...] = ("torso", "hips", "head")
+# Patch 1: the other half of the denominator choice. Every ruler above divides the
+# result's shoulder/torso by the person's, so a result hip keypoint that jumps up under a
+# generated hem shortens the result torso length and reports a 12-21% widening with no
+# body movement at all -- panel-07 read -0.426 and panel-01 -0.371 while visibly clean.
+# The person-anchored width ratio keeps the person's torso length in both denominators and
+# so cancels the result hips completely, and it is gated on the pelvis staying put so a
+# real body move still falls back to the independent ruler.
+SHOULDER_ALIGNED_RULER = "aligned"
+SHOULDER_VARIANTS: tuple[str, ...] = (*SHOULDER_RULERS, SHOULDER_ALIGNED_RULER)
+SHOULDER_INDEPENDENT_RULER = "independent"
+# Which of the two scores: SHOULDER_INDEPENDENT_RULER (the ruler chain above) or
+# SHOULDER_ALIGNED_RULER. The Phase 0 audit scores both on the 160 graded pictures and
+# flips this constant to the higher-AUROC one; until that number exists the independent
+# ruler stays the default, and the other one is still reported under ``variants``.
+SHOULDER_SCORING_RULER: str = SHOULDER_INDEPENDENT_RULER
+SHOULDER_SCORING_RULER_CHOICES: tuple[str, ...] = (SHOULDER_INDEPENDENT_RULER,
+                                                  SHOULDER_ALIGNED_RULER)
+# How far the hip midpoints may move between the person photo and the result before the
+# pelvis counts as moved, as a fraction of the frame height.
+SHOULDER_HIP_GATE_FRACTION = 0.05
 
 
 class GeometryTermError(RuntimeError):
@@ -342,6 +406,13 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray) -> dict[s
     (1 - L1) could not go below 0.70 on that corruption. A product is 0 as soon as
     either factor is 0, so "kept the shapes, changed the colours" scores as the defect
     it is.
+
+    The structure factor is averaged over the kept mask **eroded by the SSIM support
+    radius**. The changed-area mask is grown by only ``MASK_DILATE_KERNEL`` pixels, which
+    is narrower than the 11 by 11 window SSIM averages over, so without the erosion a ring
+    of kept pixels is scored against windows that contain the edit and every candidate
+    loses structure for having done the thing it was asked to do. Both means are reported,
+    so the bleed stays visible in the offline table.
     """
     result_array = to_rgb_array(result)
     person_array = to_rgb_array(person, size=(result_array.shape[1], result_array.shape[0]))
@@ -353,18 +424,28 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray) -> dict[s
         total = int(kept.sum())
     if total == 0:
         return {"value": WORST_VALUE["kept_area"], "flag": "kept_area_empty", "kept_pixels": 0,
-                "ssim_mean": None, "delta_e_mean": None, "colour_fidelity": None}
+                "ssim_mean": None, "ssim_mean_plain": None, "delta_e_mean": None,
+                "colour_fidelity": None}
     structure = ssim_map(result_array, person_array)
     difference = delta_e_map(result_array, person_array)
-    ssim_mean = float(np.clip(structure[kept].mean(), 0.0, 1.0))
+    ssim_region = erode_mask(kept, 2 * SSIM_SUPPORT_RADIUS + 1)
+    ssim_fallback = int(ssim_region.sum()) < MIN_REGION_PIXELS
+    if ssim_fallback:
+        ssim_region = kept
+    ssim_mean = float(np.clip(structure[ssim_region].mean(), 0.0, 1.0))
+    ssim_mean_plain = float(np.clip(structure[kept].mean(), 0.0, 1.0))
     delta_e_mean = float(difference[kept].mean())
     fidelity = max(0.0, 1.0 - delta_e_mean / KEEP_DELTA_E_MAX)
     low, high = TERM_RANGES["kept_area"]
     return {
         "value": float(min(max(ssim_mean * fidelity, low), high)),
-        "flag": "kept_area_plain_region" if fallback else "",
+        "flag": ("kept_ssim_plain_region" if ssim_fallback
+                 else ("kept_area_plain_region" if fallback else "")),
         "kept_pixels": total,
+        "ssim_pixels": int(ssim_region.sum()),
         "ssim_mean": ssim_mean,
+        "ssim_mean_plain": ssim_mean_plain,
+        "ssim_support_radius": SSIM_SUPPORT_RADIUS,
         "delta_e_mean": delta_e_mean,
         "colour_fidelity": fidelity,
     }
@@ -407,6 +488,24 @@ def _visible(points: Mapping[str, Mapping[str, float]], name: str) -> tuple[floa
     return float(row["x"]), float(row["y"])
 
 
+def shoulder_width(points: Mapping[str, Mapping[str, float]]) -> float | None:
+    """Pixel distance between the two shoulder keypoints, or None if one is missing."""
+    left = _visible(points, "left_shoulder")
+    right = _visible(points, "right_shoulder")
+    if left is None or right is None:
+        return None
+    return math.dist(left, right)
+
+
+def hip_midpoint(points: Mapping[str, Mapping[str, float]]) -> tuple[float, float] | None:
+    """Midpoint of the two hip keypoints, or None if one is missing."""
+    left = _visible(points, "left_hip")
+    right = _visible(points, "right_hip")
+    if left is None or right is None:
+        return None
+    return ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
+
+
 def pose_ratio(points: Mapping[str, Mapping[str, float]],
                ruler: str = "head") -> dict[str, Any]:
     """Scale-free shoulder ratio against a built-in ruler.
@@ -428,12 +527,10 @@ def pose_ratio(points: Mapping[str, Mapping[str, float]],
         return {"ratio": None, "ruler": None, "reason": "missing_shoulders"}
     shoulder = math.dist(left, right)
     if ruler == "torso":
-        left_hip = _visible(points, "left_hip")
-        right_hip = _visible(points, "right_hip")
-        if left_hip is None or right_hip is None:
-            return {"ratio": None, "ruler": None, "reason": "missing_hips"}
         shoulder_mid = ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
-        hip_mid = ((left_hip[0] + right_hip[0]) / 2.0, (left_hip[1] + right_hip[1]) / 2.0)
+        hip_mid = hip_midpoint(points)
+        if hip_mid is None:
+            return {"ratio": None, "ruler": None, "reason": "missing_hips"}
         torso = math.dist(shoulder_mid, hip_mid)
         if shoulder <= 0 or torso <= 1e-6:
             return {"ratio": None, "ruler": None, "reason": "degenerate_ruler"}
@@ -457,9 +554,93 @@ def pose_ratio(points: Mapping[str, Mapping[str, float]],
     return {"ratio": shoulder / head, "ruler": "shoulder_over_neck_nose", "reason": ""}
 
 
+def independent_shoulder_variant(result_points: Mapping[str, Mapping[str, float]],
+                                 person_points: Mapping[str, Mapping[str, float]],
+                                 name: str) -> dict[str, Any]:
+    """One of the three independent rulers, measured on both frames."""
+    result_ratio = pose_ratio(result_points, name)
+    person_ratio = pose_ratio(person_points, name)
+    entry: dict[str, Any] = {
+        "ruler": result_ratio["ruler"] or person_ratio["ruler"],
+        "result_ratio": result_ratio["ratio"],
+        "person_ratio": person_ratio["ratio"],
+        "available": False,
+        "relative": None,
+        "value": None,
+        "reason": result_ratio["reason"] or person_ratio["reason"],
+    }
+    if entry["result_ratio"] is not None and entry["person_ratio"] is not None:
+        relative = entry["result_ratio"] / entry["person_ratio"]
+        entry["relative"] = float(relative)
+        entry["value"] = shoulder_penalty(relative)
+        entry["available"] = True
+    return entry
+
+
+def aligned_shoulder_variant(result_points: Mapping[str, Mapping[str, float]],
+                             person_points: Mapping[str, Mapping[str, float]],
+                             frame_height: float | None) -> dict[str, Any]:
+    """Person-anchored width ratio, in the same entry shape as the independent rulers.
+
+    ``ratio = shoulder_width(result) / shoulder_width(person)``. Dividing both the
+    numerator and the ``person`` half of an independent ratio by the person's torso
+    length leaves this quantity, so the result hip keypoints appear nowhere in it and the
+    upward hip jitter that made clean panels read -0.35 is gone. That also means a whole
+    body that really moved is invisible to it, so the measurement is gated on the pelvis
+    having stayed put: the hip midpoint may travel at most
+    ``SHOULDER_HIP_GATE_FRACTION`` of the frame height between the person photo and the
+    result. ``gate`` records which check ran, so the Phase 0 table can separate a failed
+    gate from a missing keypoint.
+
+    The two frames must share a pixel grid for the gate to mean anything -- the result is
+    pixel-aligned with the person photo by construction, which is the same reason the
+    registered pixels can be compared at all.
+    """
+    result_width = shoulder_width(result_points)
+    person_width = shoulder_width(person_points)
+    entry: dict[str, Any] = {
+        "ruler": "shoulder_over_shoulder",
+        "result_ratio": result_width,
+        "person_ratio": person_width,
+        "available": False,
+        "relative": None,
+        "value": None,
+        "reason": "",
+        "gate": "missing_shoulders",
+    }
+    if result_width is None or person_width is None or person_width <= 1e-6:
+        entry["reason"] = "missing_shoulders"
+        return entry
+    result_hip = hip_midpoint(result_points)
+    person_hip = hip_midpoint(person_points)
+    if frame_height is None:
+        entry["reason"] = "gate_unmeasurable"
+        entry["gate"] = "no_frame_height"
+        return entry
+    if result_hip is None or person_hip is None:
+        entry["reason"] = "gate_unmeasurable"
+        entry["gate"] = "missing_hips"
+        return entry
+    travel = math.dist(result_hip, person_hip)
+    limit = SHOULDER_HIP_GATE_FRACTION * float(frame_height)
+    entry["hip_travel"] = travel
+    entry["hip_gate_limit"] = limit
+    if travel > limit:
+        entry["reason"] = "hip_gate_failed"
+        entry["gate"] = "failed"
+        return entry
+    relative = result_width / person_width
+    entry["relative"] = float(relative)
+    entry["value"] = shoulder_penalty(relative)
+    entry["available"] = True
+    entry["gate"] = "passed"
+    return entry
+
+
 def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
                              person_points: Mapping[str, Mapping[str, float]],
-                             ruler: str | None = None) -> dict[str, Any]:
+                             ruler: str | None = None, *,
+                             frame_height: float | None = None) -> dict[str, Any]:
     """Proportion change of shoulder width, in [-1, 0].
 
     The penalty is ``-min(1, |log(ratio / target)| / log 2)``: a ratio of 1 scores 0
@@ -467,42 +648,48 @@ def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
     and narrowing cost the same, which a linear ``|ratio - 1|`` cannot do -- a doubled
     ratio and a halved one are the same relative error.
 
-    Every ruler is measured on both frames; ``variants`` keeps all of them so the
-    offline report can show what each one would have scored. ``ruler=None`` picks
-    the first usable entry of ``SHOULDER_RULERS``; naming a ruler forces it and
-    makes the term unmeasurable when that ruler alone is unavailable.
+    Every ruler is measured on both frames; ``variants`` keeps all of them, the
+    person-anchored ``aligned`` width ratio included, so the offline report can show what
+    each one would have scored even though only one of them scores. ``ruler=None`` scores
+    with ``SHOULDER_SCORING_RULER``: the independent chain, or the aligned ratio when the
+    Phase 0 measurement preferred it, which falls back to the chain whenever its hip gate
+    fails. Naming one of ``SHOULDER_RULERS`` forces that ruler and makes the term
+    unmeasurable when it alone is unavailable; naming ``aligned`` forces it with the same
+    fallback, because a failed hip gate is a reason to distrust the ruler rather than a
+    reason to fail the candidate.
     """
-    variants: dict[str, dict[str, Any]] = {}
-    for name in SHOULDER_RULERS:
-        result_ratio = pose_ratio(result_points, name)
-        person_ratio = pose_ratio(person_points, name)
-        entry: dict[str, Any] = {
-            "ruler": result_ratio["ruler"] or person_ratio["ruler"],
-            "result_ratio": result_ratio["ratio"],
-            "person_ratio": person_ratio["ratio"],
-            "available": False,
-            "relative": None,
-            "value": None,
-            "reason": result_ratio["reason"] or person_ratio["reason"],
-        }
-        if entry["result_ratio"] is not None and entry["person_ratio"] is not None:
-            relative = entry["result_ratio"] / entry["person_ratio"]
-            entry["relative"] = float(relative)
-            entry["value"] = shoulder_penalty(relative)
-            entry["available"] = True
-        variants[name] = entry
+    _require(ruler is None or ruler in SHOULDER_VARIANTS, f"unknown shoulder ruler: {ruler}")
+    variants: dict[str, dict[str, Any]] = {
+        name: independent_shoulder_variant(result_points, person_points, name)
+        for name in SHOULDER_RULERS
+    }
+    variants[SHOULDER_ALIGNED_RULER] = aligned_shoulder_variant(
+        result_points, person_points, frame_height)
 
-    order = (ruler,) if ruler is not None else SHOULDER_RULERS
+    if ruler is None:
+        scoring = SHOULDER_SCORING_RULER
+        _require(scoring in SHOULDER_SCORING_RULER_CHOICES,
+                 f"unknown SHOULDER_SCORING_RULER: {scoring}")
+        # The aligned ratio carries the independent chain behind it, because its hip gate
+        # is a reason to distrust the ruler rather than a reason to fail the candidate.
+        order = (SHOULDER_ALIGNED_RULER, *SHOULDER_RULERS) if scoring == SHOULDER_ALIGNED_RULER \
+            else SHOULDER_RULERS
+    else:
+        order = (ruler,) if ruler != SHOULDER_ALIGNED_RULER else \
+            (SHOULDER_ALIGNED_RULER, *SHOULDER_RULERS)
     chosen = next((name for name in order if variants[name]["available"]), None)
+    gate = variants[SHOULDER_ALIGNED_RULER]["gate"]
     if chosen is None:
         return {"value": WORST_VALUE["shoulder_proportion"], "flag": "shoulder_unmeasurable",
-                "ruler": None, "result_ratio": None, "person_ratio": None,
-                "relative": None, "saturated": True, "variants": variants}
+                "ruler": None, "ruler_name": None, "result_ratio": None,
+                "person_ratio": None, "relative": None, "saturated": True,
+                "aligned_gate": gate, "fallback_from": None, "variants": variants}
     entry = variants[chosen]
     return {"value": entry["value"], "flag": "", "ruler": entry["ruler"],
             "ruler_name": chosen, "result_ratio": entry["result_ratio"],
             "person_ratio": entry["person_ratio"], "relative": entry["relative"],
-            "saturated": entry["value"] <= -1.0, "variants": variants}
+            "saturated": entry["value"] <= -1.0, "aligned_gate": gate,
+            "fallback_from": order[0] if chosen != order[0] else None, "variants": variants}
 
 
 def shoulder_penalty(relative: float) -> float:
@@ -609,18 +796,31 @@ def arm_coverage_term(result_points: Mapping[str, Mapping[str, float]], label_ma
     for reporting only, on the ``bin``/``bin_value`` keys of the details; it never
     gates the score. Without a coverage profile in the cache the term cannot say
     anything about this garment and returns 0.0 with a flag.
+
+    Patch 3: an arm the person had and the result lost is a defect, not missing data. The
+    old code dropped an unmeasurable arm and averaged whatever was left, so panel-11 --
+    two arms on the person, one shoulder-to-wrist chain gone on the result, an obvious
+    sleeve artifact -- scored -0.050. Each doubly-missing arm now contributes a full-arm
+    error of 1.0 to the same ``0.5 * mean + 0.5 * max`` aggregation.
     """
     _require(bin_label in SLEEVE_BINS, f"unknown sleeve bin: {bin_label}")
     targets = {
         segment: None if expected is None else _expected_coverage(expected, segment)
         for segment in ARM_SEGMENTS
     }
+    person_arms = sum(
+        _visible(person_points, f"{side}_elbow") is not None
+        and _visible(person_points, f"{side}_wrist") is not None
+        for side in ("left", "right")
+    )
     per_arm: list[dict[str, Any]] = []
+    unmeasurable: list[str] = []
     for side in ("left", "right"):
         shoulder = _visible(result_points, f"{side}_shoulder")
         elbow = _visible(result_points, f"{side}_elbow")
         wrist = _visible(result_points, f"{side}_wrist")
         if elbow is None and wrist is None:
+            unmeasurable.append(side)
             continue
         forearm = sleeve_fraction(label_map, elbow, wrist) if elbow and wrist else {
             "garment_fraction": None, "skin_fraction": None}
@@ -628,6 +828,7 @@ def arm_coverage_term(result_points: Mapping[str, Mapping[str, float]], label_ma
             "garment_fraction": None, "skin_fraction": None}
         measured = {"upper": upper["garment_fraction"], "fore": forearm["garment_fraction"]}
         if not any(value is not None for value in measured.values()):
+            unmeasurable.append(side)
             continue
         per_arm.append({
             "side": side,
@@ -636,12 +837,12 @@ def arm_coverage_term(result_points: Mapping[str, Mapping[str, float]], label_ma
             "upper_skin_fraction": upper["skin_fraction"],
             "measured": measured,
         })
-    person_arms = sum(
-        _visible(person_points, f"{side}_elbow") is not None
-        and _visible(person_points, f"{side}_wrist") is not None
-        for side in ("left", "right")
-    )
-    detail: dict[str, Any] = {"arms_measured": len(per_arm), "person_arms": person_arms,
+    # Only an arm the person actually had can have been destroyed by the edit; a person
+    # photo with one visible arm leaves the missing side unexplained rather than penalised.
+    missing_arms = unmeasurable if person_arms >= 2 else []
+    detail: dict[str, Any] = {"valid_arms_result": len(per_arm),
+                              "valid_arms_person": person_arms,
+                              "missing_arms": missing_arms,
                               "bin": bin_label, "per_arm": per_arm}
     if not per_arm:
         # Broken pose inside the shirt is a defect; a person photo with no visible
@@ -670,6 +871,11 @@ def arm_coverage_term(result_points: Mapping[str, Mapping[str, float]], label_ma
                   if targets[segment] is not None and arm["measured"][segment] is not None]
         if values:
             arm_errors[str(arm["side"])] = float(np.mean(values))
+    if any(target is not None for target in targets.values()):
+        # A full-arm error only means something against a garment whose own coverage is
+        # known; without that profile the term returns 0.0 with a flag as before.
+        for side in missing_arms:
+            arm_errors[side] = 1.0
     bin_penalty = _bin_penalty(per_arm, bin_label)
     bin_value = 0.0 if bin_label == "review" else _arm_value(bin_penalty)
     detail.update({"measured": measured_mean, "expected": targets,
@@ -770,17 +976,66 @@ def patch_grid_mask(mask: np.ndarray, *, grid: tuple[int, int] = PATCH_GRID,
 
 
 @dataclass(frozen=True)
+class GarmentTexture:
+    """High-frequency summary of one masked garment canvas.
+
+    ``gradient`` holds the Sobel magnitude of the luminance and ``local_std`` the local
+    luminance standard deviation, both sampled only at pixels whose whole neighbourhood
+    lies inside the garment mask (the mid-grey fill would otherwise contribute edges of
+    its own). They are compared through their histograms, which is what makes the
+    comparison blind to where a pixel sits and sensitive only to how much fine detail
+    the garment carries: a smoothed metallic fabric keeps its silhouette and loses its
+    sparkle, and only this half of the term sees that.
+    """
+
+    gradient: np.ndarray
+    local_std: np.ndarray
+
+
+def garment_texture(view: Mapping[str, Any]) -> GarmentTexture | None:
+    """Sobel-magnitude and local luminance std of a letterboxed garment canvas."""
+    mask = np.asarray(view["mask"], dtype=bool)
+    interior = erode_mask(mask, TEXTURE_STD_WINDOW)
+    if int(interior.sum()) < MIN_REGION_PIXELS:
+        return None
+    luminance = cv2.cvtColor(np.asarray(view["rgb"], np.uint8),
+                             cv2.COLOR_RGB2GRAY).astype(np.float32)
+    grad_x = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = np.sqrt(grad_x * grad_x + grad_y * grad_y) * TEXTURE_GRADIENT_TO_255
+    window = (TEXTURE_STD_WINDOW, TEXTURE_STD_WINDOW)
+    mean = cv2.blur(luminance, window)
+    mean_square = cv2.blur(luminance * luminance, window)
+    local_std = np.sqrt(np.clip(mean_square - mean * mean, 0.0, None)) * TEXTURE_STD_TO_255
+    return GarmentTexture(gradient=magnitude[interior], local_std=local_std[interior])
+
+
+def garment_texture_similarity(first: GarmentTexture, second: GarmentTexture) -> dict[str, float]:
+    """Gradient-magnitude and local-std histogram agreement, each in [0, 1].
+
+    ``histogram_wasserstein`` already reads a distribution over the 0..255 axis, so the
+    two channels reuse it instead of multiplying the number of histogram helpers.
+    """
+    gradient = 1.0 - histogram_wasserstein(first.gradient, second.gradient, TEXTURE_HIST_BINS)
+    local_std = 1.0 - histogram_wasserstein(first.local_std, second.local_std, TEXTURE_HIST_BINS)
+    return {"gradient": float(np.clip(gradient, 0.0, 1.0)),
+            "local_std": float(np.clip(local_std, 0.0, 1.0))}
+
+
+@dataclass(frozen=True)
 class GarmentPatchSet:
-    """One garment view: patch tokens of two DINOv2 blocks and each patch's centre.
+    """One garment view: patch tokens of two DINOv2 blocks, centres and texture.
 
     ``centres`` holds the normalised centre of every kept patch in [0, 1]^2 on the
     letterboxed canvas, so a flat patch and a worn patch are only allowed to match
-    when they sit at the same place on the garment.
+    when they sit at the same place on the garment. ``texture`` is the same canvas seen
+    as high-frequency content, which the two frozen blocks do not rank.
     """
 
     mid: np.ndarray
     final: np.ndarray
     centres: np.ndarray
+    texture: GarmentTexture | None = None
 
 
 def _region_bbox(region: np.ndarray, margin: float) -> tuple[int, int, int, int] | None:
@@ -828,6 +1083,48 @@ def letterbox_view(image: Any, region: np.ndarray, *, grid: tuple[int, int] = PA
         mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST).astype(bool)
     return {"rgb": np.ascontiguousarray(canvas), "mask": canvas_mask, "bbox": box,
             "grid": grid}
+
+
+def worn_garment_mask(image: Any, labels: np.ndarray,
+                      changed_mask: np.ndarray) -> dict[str, Any]:
+    """The worn garment: parser top-or-dress, intersected with the edited area.
+
+    The parser is not a garment segmenter on tops. It splits one top between
+    ``upper_clothes`` and ``dress``, which cut the mask in two at the waist
+    (panel-09/19/20), and on panel-12 it labelled an entire floral skirt ``dress``, so the
+    old top+dress+scarf mask swallowed the skirt as garment. The union of the two garment
+    classes closes the waist split, and intersecting it with the dilated changed area
+    keeps the parts the editor actually replaced, which drops both the skirt and any
+    trouser the parser called a dress. The scarf is no longer a garment class.
+
+    ``counts`` records the two constructions side by side -- patch counts on the same
+    letterboxed grid the term matches on, plus the pixel counts that explain them -- so
+    the Phase 0 audit can quote both numbers for the same picture.
+    """
+    labels = np.asarray(labels)
+    changed = np.asarray(changed_mask, dtype=bool)
+    _require(labels.shape[:2] == changed.shape[:2], "labels and changed mask differ in size")
+    garment = np.isin(labels, WORN_MASK_GARMENT_LABELS)
+    scarf = labels == PARSER_KEEP_LABELS[2]
+    # What the old ``np.isin(labels, PARSER_KEEP_LABELS)`` mask kept, kept for comparison.
+    parser_only = garment | scarf
+    edited = dilate_mask(changed, WORN_MASK_EDIT_DILATE)
+    mask = garment & edited & ~np.isin(labels, WORN_MASK_EXCLUDED_LABELS)
+
+    def patch_count(region: np.ndarray) -> int:
+        view = letterbox_view(image, region)
+        return 0 if view is None else int(patch_grid_mask(view["mask"]).sum())
+
+    counts = {
+        "parser_patches": patch_count(parser_only),
+        "mask_patches": patch_count(mask),
+        "parser_pixels": int(parser_only.sum()),
+        "mask_pixels": int(mask.sum()),
+        "scarf_pixels_excluded": int((scarf & ~mask).sum()),
+        "edit_clipped_pixels": int((garment & ~edited).sum()),
+        "skirt_pixels_excluded": int((np.isin(labels, WORN_MASK_SKIRT_LABELS) & ~mask).sum()),
+    }
+    return {"mask": mask, "parser_mask": parser_only, "counts": counts}
 
 
 def patch_centres(grid_mask: np.ndarray, *, grid: tuple[int, int] = PATCH_GRID) -> np.ndarray:
@@ -892,27 +1189,56 @@ def quadrant_similarity(first: GarmentPatchSet, second: GarmentPatchSet) -> floa
     return float(np.mean(scores)) if scores else None
 
 
-def garment_patch_term(worn: GarmentPatchSet | None,
-                      flat: GarmentPatchSet | None) -> dict[str, Any]:
-    """Garment patch-match term, in [0, 1], higher meaning the garment survived."""
+def garment_patch_term(worn: GarmentPatchSet | None, flat: GarmentPatchSet | None, *,
+                      worn_mask_counts: Mapping[str, int] | None = None) -> dict[str, Any]:
+    """Garment patch-match term, in [0, 1], higher meaning the garment survived.
+
+    Two halves. The structural half is the spatially constrained match on an intermediate
+    and the final DINOv2 block plus the 2 by 2 quadrant means, which ranks shape, print
+    and layout. The texture half is the gradient and local-std agreement of the aligned
+    masked crops, which ranks the detail the frozen blocks ignore: panel-13 kept generic
+    stripes and lost the cuff trim, panel-20 kept the silhouette and smoothed the metallic
+    sparkle, and both escaped above 0.69 on structure alone. The two halves are combined
+    as a weighted mean with the module constants rather than a product: smoothing the
+    fabric is no reason to stop paying for the silhouette that survived, and the reverse
+    holds just as well, so neither half should be able to erase the other.
+    """
+    counts = dict(worn_mask_counts or {})
     if worn is None or flat is None:
         return {"value": WORST_VALUE["garment_patch"], "flag": "garment_region_empty",
-                "worn_patches": 0, "flat_patches": 0,
-                "block_similarity": None, "quadrant_similarity": None}
+                "worn_patches": 0, "flat_patches": 0, "block_similarity": None,
+                "quadrant_similarity": None, "structure_similarity": None,
+                "texture_similarity": None, "gradient_similarity": None,
+                "local_std_similarity": None, **counts}
     blocks = block_similarity(worn, flat)
     quadrants = quadrant_similarity(worn, flat)
-    if quadrants is None:
-        value = blocks
+    structure = blocks if quadrants is None else \
+        GARMENT_LAYER_WEIGHT * blocks + GARMENT_QUADRANT_WEIGHT * quadrants
+    texture: dict[str, float] | None = None
+    if worn.texture is not None and flat.texture is not None:
+        channels = garment_texture_similarity(worn.texture, flat.texture)
+        texture = {**channels, "value": 0.5 * (channels["gradient"] + channels["local_std"])}
+    if texture is None:
+        # The texture half needs the masked crops. A view built without them can only
+        # report structure, and says so instead of passing off half a term as the whole.
+        value = structure
+        flag = "garment_texture_unmeasurable"
     else:
-        value = GARMENT_LAYER_WEIGHT * blocks + GARMENT_QUADRANT_WEIGHT * quadrants
+        value = GARMENT_STRUCTURE_WEIGHT * structure + GARMENT_TEXTURE_WEIGHT * texture["value"]
+        flag = ""
     low, high = TERM_RANGES["garment_patch"]
     return {
         "value": float(min(max(value, low), high)),
-        "flag": "",
+        "flag": flag,
         "worn_patches": int(worn.final.shape[0]),
         "flat_patches": int(flat.final.shape[0]),
         "block_similarity": float(blocks),
         "quadrant_similarity": None if quadrants is None else float(quadrants),
+        "structure_similarity": float(structure),
+        "texture_similarity": None if texture is None else float(texture["value"]),
+        "gradient_similarity": None if texture is None else float(texture["gradient"]),
+        "local_std_similarity": None if texture is None else float(texture["local_std"]),
+        **counts,
     }
 
 
@@ -969,6 +1295,14 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
     whose top and bottom halves were swapped scores a perfect 0. Splitting the garment
     box into three horizontal thirds and weighting the strip distance at 0.6 catches
     that, while the global term keeps the plain "wrong colour" case.
+
+    The distance maps to a similarity through the shifted exponential
+    ``clip(exp(-alpha * (D - D_ref)), 0, 1)``. A plain ``exp(-alpha * D)`` is anchored at
+    zero, so a garment pair that really is 0.02 apart cannot be told from a perfect match
+    without sending the whole real range to the floor; anchoring at ``D_ref`` puts the
+    clean pairs near 1.0 and leaves ``alpha`` to set the slope through the band real
+    candidates occupy. Both constants and the raw distances ride along in the details, so
+    the Phase 0 run can report the percentiles it calibrated them from.
     """
     flat_region = np.asarray(flat_region, dtype=bool)
     worn_region = np.asarray(worn_region, dtype=bool)
@@ -988,7 +1322,8 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
         strip_distances.append(colour_distance(flat_lab, flat_strip, worn_lab, worn_strip)[0])
     strip_distance = (float(np.mean(strip_distances)) if strip_distances else global_distance)
     distance = COLOUR_GLOBAL_WEIGHT * global_distance + COLOUR_STRIP_WEIGHT * strip_distance
-    value = math.exp(-COLOUR_ALPHA * distance)
+    shifted = distance - COLOUR_REFERENCE_DISTANCE
+    value = 1.0 if shifted <= 0.0 else math.exp(-COLOUR_ALPHA * shifted)
     low, high = TERM_RANGES["lab_colour"]
     return {
         "value": float(min(max(value, low), high)),
@@ -997,6 +1332,9 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
         "distance_global": global_distance,
         "distance_strips": strip_distance,
         "distance": distance,
+        "distance_shifted": shifted,
+        "alpha": COLOUR_ALPHA,
+        "reference_distance": COLOUR_REFERENCE_DISTANCE,
         "strips_used": len(strip_distances),
         "flat_pixels": int(flat_region.sum()),
         "worn_pixels": int(worn_region.sum()),
@@ -1056,9 +1394,15 @@ def term_contract() -> dict[str, Any]:
                 "torso": "shoulder width / shoulder-midpoint to hip-midpoint distance",
                 "hips": "shoulder width / hip width",
                 "head": "shoulder width / shoulder-midpoint to nose distance",
+                "aligned": "shoulder width on the result / shoulder width on the person, "
+                            "gated on the hip midpoints staying put",
             },
             "ruler_policy": "first usable ruler of the order, every ruler is also reported as a "
                             "non-scoring variant",
+            "scoring_ruler": SHOULDER_SCORING_RULER,
+            "scoring_ruler_choices": list(SHOULDER_SCORING_RULER_CHOICES),
+            "aligned_gate": f"hip midpoints within {SHOULDER_HIP_GATE_FRACTION} of the frame "
+                            "height, else the independent ruler chain scores",
             "target_ratio": SHOULDER_TARGET_RATIO,
             "penalty": "-min(1, |log(result/person / target)| / log(2))",
             "missing_value": "-1 when no ruler is usable on either frame",
@@ -1082,15 +1426,21 @@ def term_contract() -> dict[str, Any]:
             "segments_compared": list(ARM_SEGMENTS),
             "error": "two-sided: |measured garment coverage - the garment's own coverage|",
             "combination": "-min(1, 0.5 * mean(e_L, e_R) + 0.5 * max(e_L, e_R))",
+            "missing_arm_rule": "2 arms on the person and fewer on the result: each lost arm "
+                                "contributes e_a = 1.0 to the same aggregation",
             "missing_value": "worst when the person photo had two visible arms, 0 otherwise",
             "no_profile_value": "0 with a flag: the cache carries no arm coverage for this garment",
         },
         "kept_area": {
             "ssim_window": SSIM_WINDOW,
             "ssim_sigma": SSIM_SIGMA,
+            "ssim_support_radius": SSIM_SUPPORT_RADIUS,
             "keep_mask": f"complement of the changed-area mask dilated by {KEEP_DILATE_KERNEL}",
+            "ssim_mask": "the kept mask eroded by the SSIM support radius, so no kept pixel is "
+                          "scored against a window that contains changed pixels; both means "
+                          "are reported (ssim_mean, ssim_mean_plain)",
             "delta_e_max": KEEP_DELTA_E_MAX,
-            "formula": "mean_K(ssim_map) * max(0, 1 - mean_K(CIE76 delta-E) / delta_e_max)",
+            "formula": "mean_Keroded(ssim_map) * max(0, 1 - mean_K(CIE76 delta-E) / delta_e_max)",
         },
         "garment_patch": {
             "patch_size": PATCH_SIZE,
@@ -1099,14 +1449,27 @@ def term_contract() -> dict[str, Any]:
             "preprocess": "tight bbox plus 5% margin, non-garment pixels mid-grey 128, "
                           "aspect-preserving letterbox, INTER_NEAREST for masks",
             "min_area_share": GARMENT_MIN_AREA_SHARE,
-            "worn_region": "parser garment labels",
+            "worn_region": "(parser top | parser dress) & dilate(changed area, "
+                           f"{WORN_MASK_EDIT_DILATE} px), minus background, face, hair, "
+                           "arms and hands",
+            "worn_mask_counts": "parser_patches vs mask_patches on the same letterboxed grid, "
+                                "plus the pixel counts that explain them",
             "flat_region": "cloth-mask",
             "matching": "0.5 * mean_worn max_flat + 0.5 * mean_flat max_worn, each max taken over "
                         "clip(cos - lambda_pos * ||p_i - p_j||_2, 0, None)",
             "position_penalty": GARMENT_POSITION_PENALTY,
             "blocks": {"mid": DINOV2_MID_BLOCK, "final": "last"},
-            "combination": f"{GARMENT_LAYER_WEIGHT} * mean(mid, final) + "
-                           f"{GARMENT_QUADRANT_WEIGHT} * 2x2 quadrant mean-feature cosine",
+            "structure": f"{GARMENT_LAYER_WEIGHT} * mean(mid, final) + "
+                         f"{GARMENT_QUADRANT_WEIGHT} * 2x2 quadrant mean-feature cosine",
+            "texture": {
+                "channels": "Sobel gradient-magnitude histogram and local luminance "
+                            "standard-deviation map histogram of the aligned masked crops",
+                "bins": TEXTURE_HIST_BINS,
+                "local_std_window": TEXTURE_STD_WINDOW,
+                "channel_weights": [0.5, 0.5],
+            },
+            "combination": f"{GARMENT_STRUCTURE_WEIGHT} * structure + "
+                           f"{GARMENT_TEXTURE_WEIGHT} * texture",
         },
         "lab_colour": {
             "space": "OpenCV 8-bit CIE Lab",
@@ -1117,7 +1480,9 @@ def term_contract() -> dict[str, Any]:
             "strip_weights": [COLOUR_GLOBAL_WEIGHT, COLOUR_STRIP_WEIGHT],
             "min_strip_pixels": COLOUR_MIN_STRIP_PIXELS,
             "alpha": COLOUR_ALPHA,
-            "similarity": "exp(-alpha * D)",
+            "reference_distance": COLOUR_REFERENCE_DISTANCE,
+            "similarity": "clip(exp(-alpha * (D - D_ref)), 0, 1)",
+            "calibration": "D_ref = dev-set 5th percentile of D, alpha = log(3) / (p95 - p5)",
         },
         "parser": {"classes": list(PARSER_CLASSES), "input_size": list(PARSER_SIZE)},
         "pose": {
@@ -1287,7 +1652,7 @@ class GeometryScorer:
         _require(final_tokens.shape[0] == expected,
                  f"patch token count {final_tokens.shape[0]} != {expected}; the grid changed")
         return GarmentPatchSet(mid=mid_tokens, final=final_tokens,
-                               centres=patch_centres(cells))
+                               centres=patch_centres(cells), texture=garment_texture(view))
 
     # -- terms -------------------------------------------------------------
 
@@ -1308,13 +1673,16 @@ class GeometryScorer:
         labels = self.parse_labels(result_array)
         result_points = self.detect_pose(result_array) if person_available else {}
 
-        shoulder = shoulder_proportion_term(result_points, person_points) if result_points else {
+        shoulder = shoulder_proportion_term(
+            result_points, person_points, frame_height=float(result_array.shape[0])
+        ) if result_points else {
             "value": WORST_VALUE["shoulder_proportion"], "flag": "shoulder_unmeasurable",
             "result_ratio": None, "person_ratio": pose_ratio(person_points)["ratio"], "ruler": None}
         arms = arm_coverage_term(result_points, labels, sleeve_bin_label, person_points,
                                  expected=sleeve_expected)
 
-        garment_region = np.isin(labels, PARSER_KEEP_LABELS)
+        worn = worn_garment_mask(result_array, labels, changed_mask)
+        garment_region = worn["mask"]
         eroded = erode_mask(garment_region, 2 * PATCH_SIZE + 1)
         worn_region = eroded if eroded.any() else garment_region
         flat_region = np.asarray(cloth_mask, dtype=bool)
@@ -1322,7 +1690,8 @@ class GeometryScorer:
         flat_region = flat_eroded if flat_eroded.any() else flat_region
         worn_view = self.garment_patches(result_array, garment_region)
         flat_view = self.garment_patches(garment_array, np.asarray(cloth_mask, dtype=bool))
-        garment_result = garment_patch_term(worn_view, flat_view)
+        garment_result = garment_patch_term(worn_view, flat_view,
+                                            worn_mask_counts=worn["counts"])
 
         keep = kept_area_term(result_array, person_array, changed_mask)
         colour = lab_colour_term(garment_array, flat_region, result_array, worn_region)
