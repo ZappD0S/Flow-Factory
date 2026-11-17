@@ -161,13 +161,16 @@ SLEEVE_BAND_OFFSETS: tuple[float, ...] = (-6.0, -3.0, 0.0, 3.0, 6.0)
 SLEEVE_BINS: tuple[str, ...] = ("long", "short", "sleeveless", "review")
 
 SHOULDER_RATIO_SLOPE = 3.0  # a third of a change in proportion reaches -1
-# Two rulers, tried in this order. The head ruler (neck midpoint to nose) is the
-# cheapest, but the nose is a face keypoint and the pose detector slides it on
-# generated faces: on the 160 graded pictures it drove the ratio far enough to
-# pin 57% of the candidates at the -1 floor. Hip width is a body keypoint on the
-# same person, moves with the silhouette rather than the face, and is unchanged by
-# an upper-body edit, so it is preferred whenever both frames have both hips.
-SHOULDER_RULERS: tuple[str, ...] = ("hips", "head")
+# Three rulers, tried in this order; each is also reported as a non-scoring
+# variant so the order is a measured claim. The head ruler (neck midpoint to nose)
+# is the oldest and the worst: the nose is a face keypoint, the pose detector
+# slides it on generated faces, and on the 160 graded pictures that drove the ratio
+# far enough to pin 57% of the candidates at the -1 floor. Hip width is a body
+# keypoint but scales with the whole body, so a horizontally widened body leaves the
+# ratio unchanged and the corruption ladder caught exactly that. The torso length
+# (shoulder midpoint to hip midpoint) is vertical, so width changes move one operand
+# only, and it never reads the face.
+SHOULDER_RULERS: tuple[str, ...] = ("torso", "hips", "head")
 
 
 class GeometryTermError(RuntimeError):
@@ -333,9 +336,14 @@ def pose_ratio(points: Mapping[str, Mapping[str, float]],
                ruler: str = "head") -> dict[str, Any]:
     """Scale-free shoulder ratio against a built-in ruler.
 
-    ``ruler="hips"`` divides the shoulder width by the hip width, ``ruler="head"``
-    by the distance from the midpoint of the two shoulders to the nose. Either way
-    zoom, crop and translation cancel out. Both operands must come from the same
+    ``ruler="torso"`` divides the shoulder width by the length from the shoulder
+    midpoint to the hip midpoint, ``ruler="hips"`` by the hip width, ``ruler="head"``
+    by the distance from the shoulder midpoint to the nose. Every one of them
+    cancels zoom, crop and translation. They differ in what they are blind to: hip
+    width scales with the whole body, so a picture whose body was widened
+    horizontally moves both operands and the ratio stays put, while the torso
+    length is a vertical measure and does not; the head ruler reads face keypoints,
+    which the detector slides on generated faces. Both operands must come from the same
     detector: the person ratio is cached by ``prepare_t018_geometry.py`` from a run
     of the same detector on the person photo.
     """
@@ -344,6 +352,17 @@ def pose_ratio(points: Mapping[str, Mapping[str, float]],
     if left is None or right is None:
         return {"ratio": None, "ruler": None, "reason": "missing_shoulders"}
     shoulder = math.dist(left, right)
+    if ruler == "torso":
+        left_hip = _visible(points, "left_hip")
+        right_hip = _visible(points, "right_hip")
+        if left_hip is None or right_hip is None:
+            return {"ratio": None, "ruler": None, "reason": "missing_hips"}
+        shoulder_mid = ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
+        hip_mid = ((left_hip[0] + right_hip[0]) / 2.0, (left_hip[1] + right_hip[1]) / 2.0)
+        torso = math.dist(shoulder_mid, hip_mid)
+        if shoulder <= 0 or torso <= 1e-6:
+            return {"ratio": None, "ruler": None, "reason": "degenerate_ruler"}
+        return {"ratio": shoulder / torso, "ruler": "shoulder_over_torso", "reason": ""}
     if ruler == "hips":
         left_hip = _visible(points, "left_hip")
         right_hip = _visible(points, "right_hip")
