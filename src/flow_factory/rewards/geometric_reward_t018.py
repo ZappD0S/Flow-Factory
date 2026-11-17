@@ -6,11 +6,12 @@
 
 The reward is reference-free at scoring time. It reads the candidate picture
 (``image``), the person photo and the flat garment photo (``condition_images``),
-the changed-area mask and the sleeve-length bin (from the cached geometry named in
-the sample ``metadata``). Ground truth was used once, offline, to measure the
-sleeve length of each garment.
+the changed-area mask and the garment's own arm-coverage profile (from the cached
+geometry named in the sample ``metadata``). Ground truth was used once, offline, to
+measure that coverage; the sleeve-length bin is read too, but only for reporting.
 
-R = b + w1 * shoulder + w2 * sleeve + w3 * keep + w4 * garment + w5 * colour,
+R = b + w1 * shoulder_proportion + w2 * arm_coverage + w3 * kept_area
+      + w4 * garment_patch + w5 * lab_colour,
 with every weight enforced non-negative.
 
 See ``geometry_terms.py`` for the term definitions and the unit tests in
@@ -100,16 +101,20 @@ class T018GeometricRewardModel(GroupwiseRewardModel):
         _require(bool(split), f"sample {index} metadata is missing 'split'")
         mask_path = Path(metadata.get("mask_path") or root / "mask" / str(split) / f"{stem}.png")
         pose_path = Path(metadata.get("pose_path") or root / "pose" / str(split) / f"{stem}.json")
-        bin_label = metadata.get("sleeve_bin")
-        if bin_label is None:
-            bin_label = self._sleeve_bins()[str(split)][stem]["bin"]
+        record = self._sleeve_profile()[str(split)].get(stem, {})
+        bin_label = metadata.get("sleeve_bin") or record.get("sleeve.bin")
+        coverage = {
+            "upper": metadata.get("sleeve_c_upper", record.get("sleeve.c_upper")),
+            "fore": metadata.get("sleeve_c_fore", record.get("sleeve.c_fore")),
+        }
         _require(mask_path.is_file(), f"missing changed-area mask: {mask_path}")
         _require(pose_path.is_file(), f"missing cached pose: {pose_path}")
         _require(bin_label in geometry_terms.SLEEVE_BINS,
                  f"sample {index} sleeve bin is invalid: {bin_label}")
-        return {"mask_path": mask_path, "pose_path": pose_path, "bin": str(bin_label)}
+        return {"mask_path": mask_path, "pose_path": pose_path, "bin": str(bin_label),
+                "coverage": coverage}
 
-    def _sleeve_bins(self) -> dict[str, dict[str, dict[str, Any]]]:
+    def _sleeve_profile(self) -> dict[str, dict[str, dict[str, Any]]]:
         if not hasattr(self, "_bins_cache"):
             path = Path(self.geometry_dir) / "sleeve.json"
             _require(path.is_file(), f"missing sleeve cache: {path}")
@@ -145,6 +150,7 @@ class T018GeometricRewardModel(GroupwiseRewardModel):
                 changed_mask=changed_mask,
                 cloth_mask=self._cloth_mask(parsed),
                 sleeve_bin_label=paths["bin"],
+                sleeve_expected=paths["coverage"],
                 person_points=person_points,
             )
             rows.append({"candidate_index": index, "stem": parsed["stem"], **scored})
