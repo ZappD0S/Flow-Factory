@@ -577,8 +577,9 @@ def sleeve_term(result_points: Mapping[str, Mapping[str, float]], label_map: np.
     if deficit:
         penalty = float(np.mean(list(deficit.values())))
         detail.update({"mode": "coverage_profile", "penalty": penalty})
-        flag = "sleeve_bin_review" if bin_label == "review" else ""
-        return {"value": _sleeve_value(penalty), "flag": flag, **detail}
+        # The review bin is measured now, so it is not a fallback and raises no flag;
+        # the bin itself is reported in the details for anyone reading the figure.
+        return {"value": _sleeve_value(penalty), "flag": "", **detail}
 
     detail.update({"mode": "bin", "penalty": bin_penalty})
     if bin_label == "review":
