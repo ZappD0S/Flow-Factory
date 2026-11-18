@@ -276,10 +276,15 @@ SHOULDER_ALIGNED_RULER = "aligned"
 SHOULDER_VARIANTS: tuple[str, ...] = (*SHOULDER_RULERS, SHOULDER_ALIGNED_RULER)
 SHOULDER_INDEPENDENT_RULER = "independent"
 # Which of the two scores: SHOULDER_INDEPENDENT_RULER (the ruler chain above) or
-# SHOULDER_ALIGNED_RULER. The Phase 0 audit scores both on the 160 graded pictures and
-# flips this constant to the higher-AUROC one; until that number exists the independent
-# ruler stays the default, and the other one is still reported under ``variants``.
-SHOULDER_SCORING_RULER: str = SHOULDER_INDEPENDENT_RULER
+# SHOULDER_ALIGNED_RULER. Phase 0 measured both on the 160 graded pictures and the aligned
+# ratio wins on three separate readings -- single-term AUROC 0.7785 against 0.7215, the
+# within-input pair accuracy 0.6121 against 0.5758, and the worst clean-panel penalty
+# -0.279 against -0.426 -- while costing 0.007 pooled AUROC, which is noise on 160 rows.
+# The ruler is what GRPO is exposed to on every update, so the false penalties it attaches
+# to clean outputs (panel-01, panel-07) weigh more than the pooled number.
+# The independent chain is still reported under ``variants`` and in the audit's
+# ``ruler_comparison``, and it remains the fallback wherever the pelvis gate refuses.
+SHOULDER_SCORING_RULER: str = SHOULDER_ALIGNED_RULER
 SHOULDER_SCORING_RULER_CHOICES: tuple[str, ...] = (SHOULDER_INDEPENDENT_RULER,
                                                   SHOULDER_ALIGNED_RULER)
 # How far the hip midpoints may move between the person photo and the result before the
@@ -704,9 +709,12 @@ def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
     fails. Naming one of ``SHOULDER_RULERS`` forces that ruler and makes the term
     unmeasurable when it alone is unavailable; naming ``aligned`` forces it with the same
     fallback, because a failed hip gate is a reason to distrust the ruler rather than a
-    reason to fail the candidate.
+    reason to fail the candidate. ``independent`` names the chain itself, which is what
+    ``ruler=None`` scored before the aligned ratio became the default, so the audit can
+    still read the old table off the same pictures.
     """
-    _require(ruler is None or ruler in SHOULDER_VARIANTS, f"unknown shoulder ruler: {ruler}")
+    _require(ruler is None or ruler in (*SHOULDER_VARIANTS, SHOULDER_INDEPENDENT_RULER),
+             f"unknown shoulder ruler: {ruler}")
     variants: dict[str, dict[str, Any]] = {
         name: independent_shoulder_variant(result_points, person_points, name)
         for name in SHOULDER_RULERS
@@ -722,6 +730,8 @@ def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
         # is a reason to distrust the ruler rather than a reason to fail the candidate.
         order = (SHOULDER_ALIGNED_RULER, *SHOULDER_RULERS) if scoring == SHOULDER_ALIGNED_RULER \
             else SHOULDER_RULERS
+    elif ruler == SHOULDER_INDEPENDENT_RULER:
+        order = SHOULDER_RULERS
     else:
         order = (ruler,) if ruler != SHOULDER_ALIGNED_RULER else \
             (SHOULDER_ALIGNED_RULER, *SHOULDER_RULERS)
