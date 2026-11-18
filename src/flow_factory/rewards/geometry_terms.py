@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,13 @@ SSIM_SUPPORT_RADIUS = SSIM_WINDOW // 2
 # above it, so the hue-rotation ladder case reads 0.0 instead of the 0.70 ceiling the
 # old additive 0.7 * SSIM + 0.3 * (1 - L1) could not go below.
 KEEP_DELTA_E_MAX = 25.0
+# CIE76 is 0 on an achromatic pixel however far its hue is rotated, so a mean over every
+# kept pixel dilutes the defect the colour factor exists for: on the 160 graded pictures
+# 87% of the kept mask is white studio background, and a full person hue rotation measured
+# 0.869 against the spec's 0.35 ceiling. The colour reading is therefore taken over the
+# kept pixels that carry colour (Lab chroma at or above this) as well, and the worse of the
+# two readings scores -- the plain mean still catches a luminance drift on the background.
+KEEP_CHROMATIC_MIN_CHROMA = 10.0
 
 # A patch match on frozen DINOv2 tokens compares shape and print, and the final block is
 # trained to ignore the very detail that separates a metal fabric from a flat grey one:
@@ -478,6 +486,8 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray) -> dict[s
     if total == 0:
         return {"value": WORST_VALUE["kept_area"], "flag": "kept_area_empty", "kept_pixels": 0,
                 "ssim_mean": None, "ssim_mean_plain": None, "delta_e_mean": None,
+                "delta_e_chromatic_mean": None, "delta_e_effective": None,
+                "chromatic_min_chroma": KEEP_CHROMATIC_MIN_CHROMA, "chromatic_pixels": 0,
                 "colour_fidelity": None}
     structure = ssim_map(result_array, person_array)
     difference = delta_e_map(result_array, person_array)
@@ -487,8 +497,16 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray) -> dict[s
         ssim_region = kept
     ssim_mean = float(np.clip(structure[ssim_region].mean(), 0.0, 1.0))
     ssim_mean_plain = float(np.clip(structure[kept].mean(), 0.0, 1.0))
+    person_lab = lab_array(person_array)
+    chroma = np.sqrt(person_lab[:, :, 1] ** 2 + person_lab[:, :, 2] ** 2)
+    chromatic = kept & (chroma >= KEEP_CHROMATIC_MIN_CHROMA)
+    chromatic_pixels = int(chromatic.sum())
     delta_e_mean = float(difference[kept].mean())
-    fidelity = max(0.0, 1.0 - delta_e_mean / KEEP_DELTA_E_MAX)
+    delta_e_chromatic = (float(difference[chromatic].mean())
+                         if chromatic_pixels >= MIN_REGION_PIXELS else None)
+    delta_e_effective = delta_e_mean if delta_e_chromatic is None \
+        else max(delta_e_mean, delta_e_chromatic)
+    fidelity = max(0.0, 1.0 - delta_e_effective / KEEP_DELTA_E_MAX)
     low, high = TERM_RANGES["kept_area"]
     return {
         "value": float(min(max(ssim_mean * fidelity, low), high)),
@@ -500,6 +518,10 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray) -> dict[s
         "ssim_mean_plain": ssim_mean_plain,
         "ssim_support_radius": SSIM_SUPPORT_RADIUS,
         "delta_e_mean": delta_e_mean,
+        "delta_e_chromatic_mean": delta_e_chromatic,
+        "delta_e_effective": delta_e_effective,
+        "chromatic_min_chroma": KEEP_CHROMATIC_MIN_CHROMA,
+        "chromatic_pixels": chromatic_pixels,
         "colour_fidelity": fidelity,
     }
 
@@ -1498,7 +1520,13 @@ def term_contract() -> dict[str, Any]:
                           "scored against a window that contains changed pixels; both means "
                           "are reported (ssim_mean, ssim_mean_plain)",
             "delta_e_max": KEEP_DELTA_E_MAX,
-            "formula": "mean_Keroded(ssim_map) * max(0, 1 - mean_K(CIE76 delta-E) / delta_e_max)",
+            "delta_e_chromatic_min_chroma": KEEP_CHROMATIC_MIN_CHROMA,
+            "delta_e_aggregation": "max(mean_K(delta-E), mean_K&chroma>=min_chroma(delta-E)); "
+                                   "the chromatic reading is skipped when fewer than "
+                                   f"{MIN_REGION_PIXELS} kept pixels carry colour, and "
+                                   "both readings are reported (delta_e_mean, "
+                                   "delta_e_chromatic_mean)",
+            "formula": "mean_Keroded(ssim_map) * max(0, 1 - delta_e_effective / delta_e_max)",
         },
         "garment_patch": {
             "patch_size": PATCH_SIZE,
@@ -1720,6 +1748,7 @@ class GeometryScorer:
                      sleeve_expected: Mapping[str, float | None] | None = None,
                      person_available: bool = True) -> dict[str, Any]:
         """Compute the five terms and the combined score for one candidate."""
+        started = time.perf_counter()
         result_array = to_rgb_array(result)
         person_frame = frame_shape(person)
         person_array = to_rgb_array(person, size=(result_array.shape[1], result_array.shape[0]))
@@ -1734,7 +1763,9 @@ class GeometryScorer:
                 interpolation=cv2.INTER_NEAREST,
             ).astype(bool)
         labels = self.parse_labels(result_array)
+        parsed = time.perf_counter()
         result_points = self.detect_pose(result_array) if person_available else {}
+        posed = time.perf_counter()
 
         shoulder = shoulder_proportion_term(
             result_points, person_points, frame_height=float(result_array.shape[0])
@@ -1753,11 +1784,13 @@ class GeometryScorer:
         flat_region = flat_eroded if flat_eroded.any() else flat_region
         worn_view = self.garment_patches(result_array, garment_region)
         flat_view = self.garment_patches(garment_array, np.asarray(cloth_mask, dtype=bool))
+        encoded = time.perf_counter()
         garment_result = garment_patch_term(worn_view, flat_view,
                                             worn_mask_counts=worn["counts"])
 
         keep = kept_area_term(result_array, person_array, changed_mask)
         colour = lab_colour_term(garment_array, flat_region, result_array, worn_region)
+        finished = time.perf_counter()
 
         values = {
             "shoulder_proportion": shoulder["value"],
@@ -1769,6 +1802,15 @@ class GeometryScorer:
         return {
             "terms": values,
             "score": combine(values, self.weights, self.bias),
+            # The runtime bar is 0.30 s per sample and the audit measures 0.353, so the
+            # split of that number is reported rather than guessed at: the parser, the
+            # pose detector, the two DINOv2 views and the numpy terms are timed apart.
+            "timings": {
+                "parse": parsed - started,
+                "pose": posed - parsed,
+                "garment_views": encoded - posed,
+                "terms": finished - encoded,
+            },
             "details": {
                 "shoulder_proportion": shoulder,
                 "arm_coverage": arms,
