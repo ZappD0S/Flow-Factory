@@ -1740,6 +1740,32 @@ class GeometryScorer:
         return GarmentPatchSet(mid=mid_tokens, final=final_tokens,
                                centres=patch_centres(cells), texture=garment_texture(view))
 
+    def global_embedding(self, image: Any) -> np.ndarray:
+        """Mean of the final DINOv2 patch tokens of the whole picture, L2-normalised.
+
+        One square resize onto the patch grid keeps the token grid the encoder was
+        trained on, and averaging the patch tokens keeps the read global instead of
+        tied to whichever crop a term happens to use. The encoder is already resident
+        for the garment views, so this costs one forward pass and no extra memory. The
+        resize ignores aspect ratio on purpose: the picture's own framing is what a
+        learned read-out is allowed to see, and letterboxing it would be a second
+        framing decision layered on top of the one the generator already made.
+        """
+        torch = self.torch
+        side = PATCH_GRID[0] * PATCH_SIZE
+        array = to_rgb_array(image)
+        resized = cv2.resize(array, (side, side), interpolation=cv2.INTER_AREA)
+        tensor = torch.from_numpy(resized).permute(2, 0, 1).float().div(255.0)
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+        tensor = ((tensor - mean) / std).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            output = self.dinov2(pixel_values=tensor, interpolate_pos_encoding=True)
+        vector = output.last_hidden_state[0, 1:, :].mean(dim=0).cpu().numpy()
+        vector = np.asarray(vector, dtype=np.float32)
+        norm = float(np.linalg.norm(vector))
+        return vector / norm if norm > 0.0 else vector
+
     # -- terms -------------------------------------------------------------
 
     def score_sample(self, *, result: Any, person: Any, garment: Any,
