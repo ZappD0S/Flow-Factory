@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""T018 geometric virtual try-on reward: five measured terms, one weighted sum.
+"""T018 geometric virtual try-on reward: seven measured terms, one weighted sum.
 
 The reward is reference-free at scoring time. It reads the candidate picture
 (``image``), the person photo and the flat garment photo (``condition_images``),
@@ -11,7 +11,8 @@ geometry named in the sample ``metadata``). Ground truth was used once, offline,
 measure that coverage; the sleeve-length bin is read too, but only for reporting.
 
 R = b + w1 * shoulder_proportion + w2 * arm_coverage + w3 * kept_area
-      + w4 * garment_patch + w5 * lab_colour,
+      + w4 * garment_patch + w5 * lab_colour
+      + w6 * in_mask_skin_face + w7 * anatomy_mask_quality,
 with every weight enforced non-negative.
 
 See ``geometry_terms.py`` for the term definitions and the unit tests in
@@ -60,8 +61,25 @@ def _parse_metadata(value: Any, index: int) -> dict[str, Any]:
     return payload
 
 
+def _load_weights_file(path: str | Path) -> dict[str, float]:
+    """Read term weights out of a contract or gate report.
+
+    ``reward_contract.json`` nests them one level down and ``gate_report.json`` nests
+    them beside a bias and a convention string, so passing either file used to fail
+    ``validate_weights`` on a key set of ``{"terms"}``.
+    """
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    candidate: Any = payload.get("weights", payload) if isinstance(payload, dict) else payload
+    for key in ("relative", "terms", "default_weights"):
+        if isinstance(candidate, dict) and isinstance(candidate.get(key), dict):
+            candidate = candidate[key]
+            break
+    _require(isinstance(candidate, dict), f"weights file carries no weight mapping: {path}")
+    return {str(name): float(value) for name, value in candidate.items()}
+
+
 class T018GeometricRewardModel(GroupwiseRewardModel):
-    """Groupwise geometric reward: five measured terms and five non-negative weights."""
+    """Groupwise geometric reward: seven measured terms and non-negative weights."""
 
     required_fields = ("image",)
     use_tensor_inputs = False
@@ -77,7 +95,7 @@ class T018GeometricRewardModel(GroupwiseRewardModel):
         weights = extras.get("weights")
         bias = float(extras.get("bias", geometry_terms.DEFAULT_BIAS))
         if isinstance(weights, str) and weights:
-            weights = json.loads(Path(weights).read_text(encoding="utf-8"))["weights"]
+            weights = _load_weights_file(weights)
         self.weights = geometry_terms.validate_weights(weights or geometry_terms.DEFAULT_WEIGHTS, bias)
         self.scorer = geometry_terms.GeometryScorer(
             self.models_dir, device=self.device, weights=self.weights, bias=bias
@@ -135,26 +153,41 @@ class T018GeometricRewardModel(GroupwiseRewardModel):
                     metadata: list[Any], *, group_id: str | int) -> list[dict[str, Any]]:
         _require(len(images) == len(conditions) == len(metadata),
                  "candidates, conditions and metadata must have equal length")
-        rows: list[dict[str, Any]] = []
+        samples: list[dict[str, Any]] = []
         for index, (image, condition, raw_metadata) in enumerate(zip(images, conditions, metadata)):
             parsed = _parse_metadata(raw_metadata, index)
             _require(isinstance(condition, (list, tuple)) and len(condition) >= 2,
                      f"group {group_id} sample {index} needs person and garment conditions")
             paths = self._geometry_paths(parsed, index)
-            changed_mask = geometry_terms.load_mask(paths["mask_path"])
-            person_points = geometry_terms.load_points(paths["pose_path"])
-            scored = self.scorer.score_sample(
-                result=image,
-                person=condition[0],
-                garment=condition[1],
-                changed_mask=changed_mask,
-                cloth_mask=self._cloth_mask(parsed),
-                sleeve_bin_label=paths["bin"],
-                sleeve_expected=paths["coverage"],
-                person_points=person_points,
-            )
-            rows.append({"candidate_index": index, "stem": parsed["stem"], **scored})
-        return rows
+            samples.append({
+                "result": image,
+                "changed_mask": geometry_terms.load_mask(paths["mask_path"]),
+                "sleeve_bin_label": paths["bin"],
+                "sleeve_expected": paths["coverage"],
+                "person": condition[0],
+                "garment": condition[1],
+                "person_available": True,
+                "stem": parsed["stem"],
+                "points": geometry_terms.load_points(paths["pose_path"]),
+                "cloth_mask": self._cloth_mask(parsed),
+            })
+        # One GRPO group usually shares one person photo and one flat garment, which is what
+        # lets the parsers run once for the whole group. A group that mixes sources is split
+        # by (person, garment) identity and scored one batch per source, in the original order.
+        partitions: dict[tuple[int, int], list[int]] = {}
+        for index, sample in enumerate(samples):
+            partitions.setdefault((id(sample["person"]), id(sample["garment"])), []).append(index)
+        rows: list[dict[str, Any] | None] = [None] * len(samples)
+        for members in partitions.values():
+            head = samples[members[0]]
+            scored = self.scorer.score_batch([samples[index] for index in members],
+                                             person=head["person"], garment=head["garment"],
+                                             cloth_mask=head["cloth_mask"],
+                                             person_points=head["points"])
+            for index, row in zip(members, scored, strict=True):
+                rows[index] = {"candidate_index": index, "stem": samples[index]["stem"], **row}
+        _require(all(row is not None for row in rows), "a candidate was never scored")
+        return [row for row in rows if row is not None]
 
     def __call__(
         self,
