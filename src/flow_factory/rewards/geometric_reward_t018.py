@@ -12,7 +12,7 @@ measure that coverage; the sleeve-length bin is read too, but only for reporting
 
 R = b + w1 * shoulder_proportion + w2 * arm_coverage + w3 * kept_area
       + w4 * garment_patch + w5 * lab_colour
-      + w6 * face_hair_preservation + w7 * anatomy_mask_quality,
+      + w6 * in_mask_skin_face + w7 * anatomy_mask_quality,
 with every weight enforced non-negative.
 
 See ``geometry_terms.py`` for the term definitions and the unit tests in
