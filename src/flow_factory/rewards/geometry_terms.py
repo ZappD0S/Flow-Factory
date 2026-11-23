@@ -170,6 +170,10 @@ WORN_MASK_EDIT_DILATE = 5
 PARSER_SKIN_LABEL = 12  # arms
 PARSER_DROPPED_LABELS: tuple[int, ...] = (13, 17)  # hands, jewelry
 PARSER_SIZE = (384, 576)  # (width, height) matching the parser's training input
+# Encoder batch ceiling. A GRPO group is scored in one call, but the group can be as wide
+# as the sampler makes it, and both the parser and DINOv2 allocate activations per image;
+# chunking bounds the peak at eight pictures whatever the group size is.
+BATCH_CHUNK = 8
 PARSER_MEAN = (0.485, 0.456, 0.406)
 PARSER_STD = (0.229, 0.224, 0.225)
 PARSER_CLASSES: tuple[str, ...] = (
@@ -2050,6 +2054,11 @@ class GeometryScorer:
 
     def parse_many(self, arrays: Sequence[np.ndarray]) -> list[tuple[np.ndarray, np.ndarray]]:
         """Batched parser pass; one (labels, confidence) pair per input picture."""
+        if len(arrays) > BATCH_CHUNK:
+            output: list[tuple[np.ndarray, np.ndarray]] = []
+            for start in range(0, len(arrays), BATCH_CHUNK):
+                output.extend(self.parse_many(arrays[start:start + BATCH_CHUNK]))
+            return output
         torch = self.torch
         if not arrays:
             return []
@@ -2081,6 +2090,11 @@ class GeometryScorer:
         ``POSE_INPUT_SIZE`` and the heatmap coordinates map back with the inverse of that
         resize.
         """
+        if len(arrays) > BATCH_CHUNK:
+            output: list[dict[str, dict[str, float]]] = []
+            for start in range(0, len(arrays), BATCH_CHUNK):
+                output.extend(self.detect_poses(arrays[start:start + BATCH_CHUNK]))
+            return output
         torch = self.torch
         if not arrays:
             return []
@@ -2121,6 +2135,11 @@ class GeometryScorer:
         kept patches leave the device. A view whose own mask covers no patch cell keeps
         its ``None`` and is skipped rather than encoded as an empty canvas.
         """
+        if len(views) > BATCH_CHUNK:
+            output: list[GarmentPatchSet | None] = []
+            for start in range(0, len(views), BATCH_CHUNK):
+                output.extend(self.garment_patches_many(views[start:start + BATCH_CHUNK]))
+            return output
         torch = self.torch
         prepared: list[tuple[int, np.ndarray]] = []
         for index, view in enumerate(views):
