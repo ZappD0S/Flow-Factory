@@ -67,10 +67,16 @@ def _load_weights_file(path: str | Path) -> dict[str, float]:
     ``reward_contract.json`` nests them one level down and ``gate_report.json`` nests
     them beside a bias and a convention string, so passing either file used to fail
     ``validate_weights`` on a key set of ``{"terms"}``.
+
+    Order matters: both files also carry ``relative``, the standardized shares the fit
+    works in, while ``terms`` holds the production weights for the raw term values. A
+    share is a few hundredths where its weight is a few tenths, so reading ``relative``
+    first scaled the reward by the wrong factor -- silently, and only on ``anatomy``
+    in practice, whose share is 0.075 against a weight of 0.407.
     """
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     candidate: Any = payload.get("weights", payload) if isinstance(payload, dict) else payload
-    for key in ("relative", "terms", "default_weights"):
+    for key in ("terms", "default_weights", "relative"):
         if isinstance(candidate, dict) and isinstance(candidate.get(key), dict):
             candidate = candidate[key]
             break

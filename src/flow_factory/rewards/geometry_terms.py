@@ -113,12 +113,15 @@ TEXTURE_STD_WINDOW = 5
 # maximum of a binary checkerboard (4 * 255 * sqrt(2)), which put every real fabric
 # gradient -- measured at 20 to 150 on the 160 graded pictures -- into bins 0 and 1 of a
 # 16-bin histogram whose bin width is 15.9. Two terms then agreed at about 0.95 whatever
-# the fabric, and only a scrambled texture moved them. Real gradients are mapped straight
-# onto the axis instead, and the local standard deviation is scaled so that a knit or a
-# metallic sheen -- 20 to 40 levels of local variation -- spans several bins rather than
-# sitting on the first one. Both axes are clipped at 255 by the histogram itself.
-TEXTURE_GRADIENT_TO_255 = 1.0
-TEXTURE_STD_TO_255 = 6.0
+# the fabric, and only a scrambled texture moved them. Mapping gradients straight onto the
+# axis fixed that but overshot in the other direction: a worn garment carries body-fold
+# shadows and wrinkles a flat product shot cannot have, so full-scale Sobel turned the
+# candidate's own drape into texture error and cost 0.009 AUROC. The current scales put the
+# measured 20..150 gradient range across most of the axis and lift 20..40 levels of local
+# variation off the first bin, without amplifying drape. Both axes are clipped at 255 by
+# the histogram itself.
+TEXTURE_GRADIENT_TO_255 = 1.0 / 5.66
+TEXTURE_STD_TO_255 = 2.0
 # Cosine similarities between DINOv2 tokens of two different garments -- a flat product
 # shot and a worn garment -- sit in a narrow band well above zero, so averaging them raw
 # compresses the whole term into 0.036 of its range. The band is rescaled onto [0, 1]
@@ -242,12 +245,11 @@ SKIN_FACE_MIN_PIXELS = MIN_REGION_PIXELS
 # The face is only scored when the edit reaches at least this share of the frame: below it
 # the face crop is too small for SSIM to say anything.
 FACE_MIN_AREA_SHARE = 0.005
-# A candidate that erases the exposed skin the person photo had (sleeve or neck) is
-# penalised in proportion to how much of it went missing below this share.
-SKIN_COLLAPSE_RATIO = 0.25
-# CIE Lab a/b Wasserstein distance -> similarity. Half a bin of the 32-bin histogram is
-# already a visible tone shift, so the decay is steep: 0.05 of distance reads 0.14.
-SKIN_TONE_ALPHA = 40.0
+# CIE Lab a/b Wasserstein distance -> similarity. The reference is the person's own face,
+# so a real candidate sits near 0.02-0.04 and the decay has to be shallow enough that
+# ordinary arm shading survives it: at alpha 40 a distance of 0.05 read 0.14, which put
+# the term at 0.337 AUROC, worse than chance.
+SKIN_TONE_ALPHA = 12.0
 ANATOMY_KEYPOINT_WEIGHTS: dict[str, float] = {
     "nose": 1.0,
     "left_shoulder": 1.0,
@@ -260,8 +262,14 @@ ANATOMY_KEYPOINT_WEIGHTS: dict[str, float] = {
 # The parser's own maximum softmax probability, averaged over the pixels the term reads.
 # A melted cloth/skin hybrid is exactly the case where the parser cannot choose a class,
 # so its margin is the cheapest uncertainty signal available without a new model.
-PARSER_MARGIN_FLOOR = 0.5
-PARSER_MARGIN_TARGET = 0.9
+# SegFormer's max-softmax over garment and skin pixels sits between 0.85 and 0.99 on real
+# candidates, so a [0.5, 0.9] band clipped almost everything to 1.0 (measured spread 0.0115,
+# ten to twenty times smaller than the other terms) and left the fit amplifying noise.
+PARSER_MARGIN_FLOOR = 0.80
+PARSER_MARGIN_TARGET = 0.98
+# ViTPose joint confidence saturates the same way, so retention is read on its own band.
+RETENTION_FLOOR = 0.60
+RETENTION_TARGET = 0.95
 # A garment mask broken into pieces is a boundary artifact; components smaller than this
 # share of the largest one are counted as fragmentation.
 FRAGMENT_MIN_SHARE = 0.005
@@ -1622,21 +1630,26 @@ def in_mask_skin_face_term(person_labels: np.ndarray, result_labels: np.ndarray,
     The agnostic mask is the part of the picture the editor is allowed to change, and it
     is also the only part every other term reads. Exposed arms, the neck, the hands and
     the chin sit inside it on a sleeveless or open-collar try-on, and a candidate that
-    recolours an arm, paints over a hand or drags a collar across the chin changes nothing
-    the other five terms can see.
+    recolours an arm or drags a collar across the chin changes nothing the other six terms
+    can see.
 
-    Three deterministic readings, multiplied:
+    Two deterministic readings, multiplied:
 
-    * tone -- the CIE Lab a/b histograms of the person's own skin pixels inside the mask
-      against the candidate's, which is what separates a plastic or sunburnt arm from a
-      real one. Lightness is left out: shading legitimately changes with pose.
+    * tone -- the CIE Lab a/b histograms of the candidate's skin pixels inside the mask
+      against the person's **face** skin, which is outside the mask and therefore carries
+      the person's real tone whatever the garment does. Lightness is left out: shading
+      legitimately changes with pose.
     * face -- SSIM of the face pixels the two pictures share inside the mask, when the
       face is big enough for the window to mean anything.
-    * collapse -- the candidate's skin area against the person's, so erasing an arm into
-      the background costs in proportion to how much went missing.
 
-    A person photo with no skin inside the mask says nothing about the edit, so the term
-    abstains at 1.0 with a flag instead of penalising.
+    Three earlier choices made the term read backwards. Its reference was the person's own
+    skin *inside* the mask, so a long-sleeved try-on was compared against the bare arms it
+    covered; a proportional collapse penalty was applied on top, so covering the arms cost
+    the term while destroying them did not; and ``SKIN_TONE_ALPHA`` was steep enough to
+    punish ordinary arm shading. Tone now has a reference the edit cannot move, the
+    collapse reading is gone (whether the sleeves match the garment is what
+    ``arm_coverage`` measures), and a candidate with no skin to compare abstains instead of
+    scoring 0.
     """
     person_labels = np.asarray(person_labels)
     result_labels = np.asarray(result_labels)
@@ -1644,27 +1657,38 @@ def in_mask_skin_face_term(person_labels: np.ndarray, result_labels: np.ndarray,
     _require(person_labels.shape[:2] == changed.shape[:2]
              and result_labels.shape[:2] == changed.shape[:2],
              "labels and changed mask differ in size")
-    person_skin = np.isin(person_labels, SKIN_LABELS) & changed
     result_skin = np.isin(result_labels, SKIN_LABELS) & changed
-    person_pixels = int(person_skin.sum())
     result_pixels = int(result_skin.sum())
-    detail: dict[str, Any] = {"person_skin_pixels": person_pixels,
-                              "result_skin_pixels": result_pixels,
+    # The reference is the part of the person the editor may not touch: the face first,
+    # then the arms, so a cropped or turned face still leaves a tone reading.
+    reference = (person_labels == FACE_LABEL) & ~changed
+    reference_kind = "face"
+    if int(reference.sum()) < SKIN_FACE_MIN_PIXELS:
+        reference = np.isin(person_labels, SKIN_LABELS) & ~changed
+        reference_kind = "skin_outside_mask"
+    reference_pixels = int(reference.sum())
+    detail: dict[str, Any] = {"result_skin_pixels": result_pixels,
+                              "reference_pixels": reference_pixels,
+                              "reference_kind": reference_kind,
                               "skin_labels": list(SKIN_LABELS)}
-    if person_pixels < SKIN_FACE_MIN_PIXELS:
-        return {"value": 1.0, "flag": "skin_face_no_region", "tone": None,
-                "face": None, "collapse": None, "tone_distance": None, **detail}
+    if reference_pixels < SKIN_FACE_MIN_PIXELS:
+        return {"value": 1.0, "flag": "skin_face_no_reference", "tone": None,
+                "face": None, "tone_distance": None, **detail}
 
     person_lab = (cv2.cvtColor(to_rgb_array(person_rgb), cv2.COLOR_RGB2LAB)
                   if person_lab is None else person_lab)
     result_lab = (cv2.cvtColor(to_rgb_array(result_rgb), cv2.COLOR_RGB2LAB)
                   if result_lab is None else result_lab)
     if result_pixels == 0:
-        tone, tone_distance = 0.0, 1.0
+        # Nothing to compare: a garment that covers the arms is not a tone defect, and
+        # whether the sleeves should be there is the arm term's question.
+        tone, tone_distance = None, None
+        tone_flag = "skin_face_no_result_skin"
     else:
-        tone_distance = _masked_wasserstein(person_lab, person_skin, result_lab,
+        tone_distance = _masked_wasserstein(person_lab, reference, result_lab,
                                             result_skin, channels=(1, 2))
         tone = float(math.exp(-SKIN_TONE_ALPHA * tone_distance))
+        tone_flag = ""
 
     person_face = (person_labels == FACE_LABEL) & changed
     face_share = float(person_face.mean())
@@ -1677,13 +1701,11 @@ def in_mask_skin_face_term(person_labels: np.ndarray, result_labels: np.ndarray,
         face_value = (float(np.clip(ssim_map(result_rgb, person_rgb)[region].mean(), 0.0, 1.0))
                       if int(region.sum()) >= SKIN_FACE_MIN_PIXELS else 0.0)
 
-    ratio = result_pixels / float(person_pixels)
-    collapse = 1.0 if ratio >= SKIN_COLLAPSE_RATIO else ratio / SKIN_COLLAPSE_RATIO
-    value = tone * collapse * (1.0 if face_value is None else face_value)
+    value = (1.0 if tone is None else tone) * (1.0 if face_value is None else face_value)
     low, high = TERM_RANGES["in_mask_skin_face"]
     detail.update({"tone": tone, "tone_distance": tone_distance, "face": face_value,
-                   "face_share": face_share, "collapse": collapse, "skin_ratio": ratio})
-    return {"value": float(min(max(value, low), high)), "flag": "", **detail}
+                   "face_share": face_share})
+    return {"value": float(min(max(value, low), high)), "flag": tone_flag, **detail}
 
 
 def keypoint_retention(person_points: Mapping[str, Mapping[str, float]],
@@ -1762,12 +1784,18 @@ def anatomy_mask_quality_term(person_points: Mapping[str, Mapping[str, float]],
     quality = 1.0 - fragments["fragmentation"]
     if margin_value is not None:
         quality *= margin_value
-    retention = joints["retention"]
+    retention_raw = joints["retention"]
+    # A kept share of 0.85 is an ordinary candidate and a share of 0.6 is a melted arm;
+    # without its own band the 0.85 sat next to 0.95 and the term could not tell them apart.
+    span = RETENTION_TARGET - RETENTION_FLOOR
+    retention = (None if retention_raw is None
+                 else float(np.clip((retention_raw - RETENTION_FLOOR) / span, 0.0, 1.0)))
     value = quality if retention is None else 0.6 * retention + 0.4 * quality
     low, high = TERM_RANGES["anatomy_mask_quality"]
     return {"value": float(min(max(value, low), high)),
             "flag": "" if retention is not None else "anatomy_no_visible_joints",
-            "retention": retention, "parser_margin": margin_raw,
+            "retention": retention, "retention_raw": retention_raw,
+            "parser_margin": margin_raw,
             "margin_quality": margin_value, "fragmentation": fragments["fragmentation"],
             "fragment_quality": quality, "visible_joints": joints["visible_joints"],
             "joints": joints["per_joint"], "garment_share": garment_share,
@@ -1933,17 +1961,23 @@ def term_contract() -> dict[str, Any]:
             "face_label": FACE_LABEL,
             "region": "the changed-area mask, which is the part of the picture the editor may change",
             "tone": "mean of the CIE Lab a and b histogram Wasserstein distances between the "
-                    "person's skin pixels and the candidate's, mapped by exp(-alpha * D)",
+                    "candidate's skin pixels inside the mask and the person's reference skin "
+                    "outside it, mapped by exp(-alpha * D)",
             "tone_alpha": SKIN_TONE_ALPHA,
+            "tone_reference": "the person's face pixels outside the mask, falling back to the "
+                              "person's arms outside the mask",
             "face": f"SSIM on the face pixels both pictures share, when the person face inside "
                     f"the mask covers at least {FACE_MIN_AREA_SHARE} of the frame",
-            "collapse": f"skin area ratio below {SKIN_COLLAPSE_RATIO} costs in proportion",
-            "missing_value": "1.0 with a flag when the person photo has no skin inside the mask",
+            "no_collapse_term": "covering the arms is a sleeve-coverage question, measured by "
+                                "arm_coverage; a candidate with no skin to compare reads 1.0",
+            "missing_value": "1.0 with a flag when the person photo has no reference skin outside "
+                             "the mask",
         },
         "anatomy_mask_quality": {
             "keypoint_weights": dict(ANATOMY_KEYPOINT_WEIGHTS),
             "retention": "per visible person joint, min(1, result confidence / person confidence), "
-                         "weighted by joint",
+                         f"weighted by joint then rescaled from [{RETENTION_FLOOR}, "
+                         f"{RETENTION_TARGET}] to [0, 1]",
             "parser_margin": f"mean maximum softmax probability over garment and skin pixels, "
                             f"rescaled from [{PARSER_MARGIN_FLOOR}, {PARSER_MARGIN_TARGET}] to [0, 1]",
             "fragmentation": f"share of the worn garment mask in components smaller than "
