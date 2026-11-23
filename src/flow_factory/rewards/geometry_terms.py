@@ -2218,6 +2218,7 @@ class GeometryScorer:
         person_array = to_rgb_array(person, size=(width, height))
         person_lab = lab_array(person_array)
         person_labels, person_confidence = self.parse_labels_with_confidence(person_array)
+        person_histogram_lab = cv2.cvtColor(person_array, cv2.COLOR_RGB2LAB)
         cloth = np.asarray(cloth_mask, dtype=bool)
         flat_region = erode_mask(cloth, PATCH_SIZE + 1)
         if not flat_region.any():
@@ -2228,6 +2229,7 @@ class GeometryScorer:
             "frame": frame,
             "person_array": person_array,
             "person_lab": person_lab,
+            "person_histogram_lab": person_histogram_lab,
             "person_chroma": np.sqrt(person_lab[:, :, 1] ** 2 + person_lab[:, :, 2] ** 2),
             "person_labels": person_labels,
             "person_confidence": person_confidence,
@@ -2333,17 +2335,24 @@ class GeometryScorer:
             garment_result = garment_patch_term(worn_views[index], state["flat_view"],
                                                 worn_mask_counts=worn[index]["counts"])
 
-            result_lab = lab_array(result_array)
+            # Two Lab conventions meet here and must not be mixed. ``lab_array`` returns
+            # CIE76-difference inputs with a and b centred on zero; the histogram terms
+            # read OpenCV's 8-bit Lab, whose a and b carry the +128 offset and therefore
+            # cover the same 0..255 axis the Wasserstein helper bins over. One conversion
+            # feeds both, so the shift is applied to a copy instead of converting twice.
+            colour_lab = cv2.cvtColor(result_array, cv2.COLOR_RGB2LAB)
+            result_lab = colour_lab.astype(np.float32)
+            result_lab[:, :, 1:] -= 128.0
             keep = kept_area_term(result_array, state["person_array"], changed,
                                   person_lab=state["person_lab"],
                                   person_chroma=state["person_chroma"],
                                   result_lab=result_lab)
             colour = lab_colour_term(state["garment_array"], state["flat_region"],
                                      result_array, worn_region,
-                                     flat_lab=state["flat_lab"], worn_lab=result_lab)
+                                     flat_lab=state["flat_lab"], worn_lab=colour_lab)
             skin_face = in_mask_skin_face_term(
                 state["person_labels"], labels, state["person_array"], result_array, changed,
-                person_lab=state["person_lab"], result_lab=result_lab)
+                person_lab=state["person_histogram_lab"], result_lab=colour_lab)
             anatomy = anatomy_mask_quality_term(state["person_points"], result_points,
                                                 labels, garment_region,
                                                 confidence=confidence)
