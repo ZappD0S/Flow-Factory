@@ -511,12 +511,24 @@ def ssim_map(first: np.ndarray, second: np.ndarray, *, sigma: float = SSIM_SIGMA
     return (numerator / denominator).astype(np.float32)
 
 
+def centred_lab(lab8: np.ndarray) -> np.ndarray:
+    """Turn OpenCV 8-bit Lab into the float units :func:`lab_array` returns.
+
+    OpenCV stores L in 0..255 and a, b offset by +128, so both the scale of L and the
+    offset of a and b have to be undone. Keep this in one place: the histogram terms bin
+    the 8-bit array and the CIE76 difference needs the centred one, and a caller that
+    derives the second from the first by hand gets the offset right and the scale wrong,
+    which reads as a plausible difference of about 100 in every kept pixel.
+    """
+    out = np.asarray(lab8, dtype=np.float32).copy()
+    out[:, :, 0] *= 100.0 / 255.0
+    out[:, :, 1:] -= 128.0
+    return out
+
+
 def lab_array(image: Any) -> np.ndarray:
     """CIE Lab as float32 with the real units: L* in 0..100, a* and b* around 0."""
-    lab = cv2.cvtColor(to_rgb_array(image), cv2.COLOR_RGB2LAB).astype(np.float32)
-    lab[:, :, 0] *= 100.0 / 255.0
-    lab[:, :, 1:] -= 128.0
-    return lab
+    return centred_lab(cv2.cvtColor(to_rgb_array(image), cv2.COLOR_RGB2LAB))
 
 
 def delta_e_map(first: np.ndarray, second: np.ndarray, *, first_lab: np.ndarray | None = None,
@@ -2341,8 +2353,7 @@ class GeometryScorer:
             # cover the same 0..255 axis the Wasserstein helper bins over. One conversion
             # feeds both, so the shift is applied to a copy instead of converting twice.
             colour_lab = cv2.cvtColor(result_array, cv2.COLOR_RGB2LAB)
-            result_lab = colour_lab.astype(np.float32)
-            result_lab[:, :, 1:] -= 128.0
+            result_lab = centred_lab(colour_lab)
             keep = kept_area_term(result_array, state["person_array"], changed,
                                   person_lab=state["person_lab"],
                                   person_chroma=state["person_chroma"],
