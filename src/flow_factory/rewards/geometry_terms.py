@@ -41,7 +41,7 @@ TERM_NAMES: tuple[str, ...] = (
     "kept_area",
     "garment_patch",
     "lab_colour",
-    "in_mask_skin_face",
+    "face_hair_preservation",
     "anatomy_mask_quality",
 )
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -50,7 +50,7 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "kept_area": 1.0,
     "garment_patch": 1.0,
     "lab_colour": 0.5,
-    "in_mask_skin_face": 0.5,
+    "face_hair_preservation": 0.5,
     "anatomy_mask_quality": 0.5,
 }
 DEFAULT_BIAS = 0.0
@@ -62,7 +62,7 @@ TERM_RANGES: dict[str, tuple[float, float]] = {
     "kept_area": (0.0, 1.0),
     "garment_patch": (0.0, 1.0),
     "lab_colour": (0.0, 1.0),
-    "in_mask_skin_face": (0.0, 1.0),
+    "face_hair_preservation": (0.0, 1.0),
     "anatomy_mask_quality": (0.0, 1.0),
 }
 WORST_VALUE: dict[str, float] = {name: TERM_RANGES[name][0] for name in TERM_NAMES}
@@ -99,6 +99,20 @@ KEEP_DELTA_E_MAX = 25.0
 # kept pixels that carry colour (Lab chroma at or above this) as well, and the worse of the
 # two readings scores -- the plain mean still catches a luminance drift on the background.
 KEEP_CHROMATIC_MIN_CHROMA = 10.0
+
+# The kept-region mean above is dilution-proof only up to a point: on the 160 graded pictures
+# 87% of the keep mask is empty studio backdrop, so a smudge on the person's shoulder or a
+# ghost of the old neckline moves a mean taken over millions of clean pixels by almost
+# nothing. The worst-blocks tail reads the same SSIM map over 16 by 16 blocks and averages the
+# worst tenth of them, which is where localized damage to the person lives -- and where the
+# 34 of 126 contested pairs that lost source integrity live too.
+KEEP_TAIL_BLOCK = 16
+KEEP_TAIL_SHARE = 0.1
+# Half the tail, half the mean: the tail alone makes every candidate with one artifact look
+# broken, and the mean alone is what the tail exists to correct.
+KEEP_TAIL_WEIGHT = 0.5
+# Below this many blocks the "worst tenth" is two blocks and the statistic is noise.
+KEEP_TAIL_MIN_BLOCKS = 8
 
 # A patch match on frozen DINOv2 tokens compares shape and print, and the final block is
 # trained to ignore the very detail that separates a metal fabric from a flat grey one:
@@ -241,15 +255,22 @@ COLOUR_REFERENCE_DISTANCE = 0.008211377611137218
 # load, so they add no checkpoint.
 SKIN_LABELS: tuple[int, ...] = (12, 13)  # arms, hands
 FACE_LABEL = 1
-SKIN_FACE_MIN_PIXELS = MIN_REGION_PIXELS
-# The face is only scored when the edit reaches at least this share of the frame: below it
-# the face crop is too small for SSIM to say anything.
-FACE_MIN_AREA_SHARE = 0.005
-# CIE Lab a/b Wasserstein distance -> similarity. The reference is the person's own face,
-# so a real candidate sits near 0.02-0.04 and the decay has to be shallow enough that
-# ordinary arm shading survives it: at alpha 40 a distance of 0.05 read 0.14, which put
-# the term at 0.337 AUROC, worse than chance.
-SKIN_TONE_ALPHA = 12.0
+HAIR_LABEL = 2
+# Term 6 reads the two classes the editor may NOT touch. It used to read skin tone inside
+# the mask against the person's face, and that failed twice: 0.337 AUROC against the face as
+# reference, 0.291 against the face with a shallower decay. The reason is not tunable. A
+# reference outside the editable region is always a different body part under different
+# light -- a person's arms are systematically darker and redder than their face -- so a
+# correctly rendered arm reads as a tone error, and the only reference that shares body part
+# and lighting is the person's own arms, which sit inside the mask by construction.
+# Preservation of face and hair needs no tone model: it compares the same pixels of the same
+# body part in the two pictures, which is the one place where the editor has no business.
+FACE_HAIR_LABELS: tuple[int, ...] = (FACE_LABEL, HAIR_LABEL)
+FACE_HAIR_MIN_PIXELS = MIN_REGION_PIXELS
+# A collar legitimately lands on the hair and chin of the result. Those pixels are the
+# garment's business and are read by garment_patch, so scoring them again here would double
+# count one defect and punish a correct high-collar try-on.
+FACE_HAIR_EXCLUDE_LABELS: tuple[int, ...] = (3, 4, 5, 6)  # top, dress, skirt, pants
 ANATOMY_KEYPOINT_WEIGHTS: dict[str, float] = {
     "nose": 1.0,
     "left_shoulder": 1.0,
@@ -556,6 +577,32 @@ def delta_e_map(first: np.ndarray, second: np.ndarray, *, first_lab: np.ndarray 
     return np.sqrt((difference * difference).sum(axis=2))
 
 
+def block_tail_mean(values: np.ndarray, region: np.ndarray, *, block: int = KEEP_TAIL_BLOCK,
+                    share: float = KEEP_TAIL_SHARE) -> float | None:
+    """Mean of the worst ``share`` of the ``block``-sized blocks that fall inside ``region``.
+
+    A localized defect -- a smudge, a ghosted collar edge, a background blob -- occupies a few
+    blocks and leaves every global mean untouched. Blocks count when at least half their area
+    is inside the region, so a boundary block is read on the part that is scored. Returns
+    ``None`` when the region is too small for a tenth of it to mean anything.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    region = np.asarray(region, dtype=bool)
+    height, width = region.shape[:2]
+    pooled: list[float] = []
+    for y in range(0, height - block + 1, block):
+        for x in range(0, width - block + 1, block):
+            window = region[y:y + block, x:x + block]
+            if int(window.sum()) * 2 < block * block:
+                continue
+            pooled.append(float(values[y:y + block, x:x + block][window].mean()))
+    if len(pooled) < KEEP_TAIL_MIN_BLOCKS:
+        return None
+    pooled.sort()
+    take = max(1, int(round(len(pooled) * share)))
+    return float(np.mean(pooled[:take]))
+
+
 def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray, *,
                    person_lab: np.ndarray | None = None,
                    person_chroma: np.ndarray | None = None,
@@ -569,7 +616,11 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray, *,
     either factor is 0, so "kept the shapes, changed the colours" scores as the defect
     it is.
 
-    The structure factor is averaged over the kept mask **eroded by the SSIM support
+    The structure factor is read twice -- as a mean over the kept mask and as the mean of the
+    worst tenth of its 16 by 16 blocks -- because a mean over a mask that is 87% empty studio
+    backdrop cannot see a smudge on the person. See ``block_tail_mean``.
+
+    It is averaged over the kept mask **eroded by the SSIM support
     radius**. The changed-area mask is grown by only ``MASK_DILATE_KERNEL`` pixels, which
     is narrower than the 11 by 11 window SSIM averages over, so without the erosion a ring
     of kept pixels is scored against windows that contain the edit and every candidate
@@ -586,8 +637,10 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray, *,
         total = int(kept.sum())
     if total == 0:
         return {"value": WORST_VALUE["kept_area"], "flag": "kept_area_empty", "kept_pixels": 0,
-                "ssim_mean": None, "ssim_mean_plain": None, "delta_e_mean": None,
+                "ssim_mean": None, "ssim_mean_plain": None, "ssim_tail": None,
+                "ssim_effective": None, "delta_e_mean": None,
                 "delta_e_chromatic_mean": None, "delta_e_effective": None,
+                "delta_e_p95": None,
                 "chromatic_min_chroma": KEEP_CHROMATIC_MIN_CHROMA, "chromatic_pixels": 0,
                 "colour_fidelity": None}
     structure = ssim_map(result_array, person_array)
@@ -599,6 +652,13 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray, *,
         ssim_region = kept
     ssim_mean = float(np.clip(structure[ssim_region].mean(), 0.0, 1.0))
     ssim_mean_plain = float(np.clip(structure[kept].mean(), 0.0, 1.0))
+    ssim_tail = block_tail_mean(structure, ssim_region)
+    # The tail is what a localized defect does to the term; the mean is what a global one
+    # (a hue-rotated person, a blurred frame) does. Half and half, and the plain mean stays
+    # reported so the offline table still shows the dilution.
+    ssim_effective = (ssim_mean if ssim_tail is None
+                      else (1.0 - KEEP_TAIL_WEIGHT) * ssim_mean
+                      + KEEP_TAIL_WEIGHT * min(ssim_mean, ssim_tail))
     person_lab = lab_array(person_array) if person_lab is None else person_lab
     chroma = (np.sqrt(person_lab[:, :, 1] ** 2 + person_lab[:, :, 2] ** 2)
               if person_chroma is None else person_chroma)
@@ -616,20 +676,30 @@ def kept_area_term(result: Any, person: Any, changed_mask: np.ndarray, *,
                          if chromatic_pixels >= MIN_REGION_PIXELS else None)
     delta_e_effective = delta_e_mean if delta_e_chromatic is None \
         else max(delta_e_mean, delta_e_chromatic)
+    # The p95 of the same map, reported only: unlike SSIM the difference map is per pixel, so
+    # its tail is already inside ``delta_e_mean`` at the scale that matters, and promoting p95
+    # to a scored reading would rescale every candidate through a constant nobody calibrated.
+    delta_e_p95 = float(np.percentile(difference[ssim_region], 95))
     fidelity = max(0.0, 1.0 - delta_e_effective / KEEP_DELTA_E_MAX)
     low, high = TERM_RANGES["kept_area"]
     return {
-        "value": float(min(max(ssim_mean * fidelity, low), high)),
+        "value": float(min(max(ssim_effective * fidelity, low), high)),
         "flag": ("kept_ssim_plain_region" if ssim_fallback
                  else ("kept_area_plain_region" if fallback else "")),
         "kept_pixels": total,
         "ssim_pixels": int(ssim_region.sum()),
         "ssim_mean": ssim_mean,
         "ssim_mean_plain": ssim_mean_plain,
+        "ssim_tail": ssim_tail,
+        "ssim_effective": ssim_effective,
+        "tail_block": KEEP_TAIL_BLOCK,
+        "tail_share": KEEP_TAIL_SHARE,
+        "tail_weight": KEEP_TAIL_WEIGHT,
         "ssim_support_radius": SSIM_SUPPORT_RADIUS,
         "delta_e_mean": delta_e_mean,
         "delta_e_chromatic_mean": delta_e_chromatic,
         "delta_e_effective": delta_e_effective,
+        "delta_e_p95": delta_e_p95,
         "chromatic_min_chroma": KEEP_CHROMATIC_MIN_CHROMA,
         "chromatic_pixels": chromatic_pixels,
         "colour_fidelity": fidelity,
@@ -1605,107 +1675,78 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
 # ---------------------------------------------------------------------- realism
 
 
-def _masked_wasserstein(first_lab: np.ndarray, first_region: np.ndarray,
-                        second_lab: np.ndarray, second_region: np.ndarray,
-                        channels: Sequence[int]) -> float:
-    """Mean Wasserstein distance of the given Lab channels over two masked regions."""
-    distances = []
-    for channel in channels:
-        left = first_lab[:, :, channel][np.asarray(first_region, dtype=bool)]
-        right = second_lab[:, :, channel][np.asarray(second_region, dtype=bool)]
-        if left.size == 0 or right.size == 0:
-            continue
-        distances.append(histogram_wasserstein(left.astype(np.float32),
-                                               right.astype(np.float32), HIST_BINS))
-    return float(np.mean(distances)) if distances else 1.0
+def face_hair_preservation_term(person_labels: np.ndarray, result_labels: np.ndarray,
+                                person_rgb: np.ndarray, result_rgb: np.ndarray, *,
+                                person_lab: np.ndarray | None = None,
+                                result_lab: np.ndarray | None = None) -> dict[str, Any]:
+    """Face and hair preservation, in [0, 1]: 1 means both are untouched.
 
+    Every other term except ``kept_area`` reads the part of the picture the editor is allowed
+    to change. On the 126 pairs where the frozen judge's reward rose while its own diagnostic
+    fell, the largest single dropper was attribute preservation -- hair, face, the person's
+    own look -- and nothing measured it: ``kept_area`` averages SSIM and Delta E over the whole
+    keep region, which on these studio photos is 87% empty backdrop, so localized damage to a
+    hairline lands in a mean of a few million clean pixels and disappears.
 
-def in_mask_skin_face_term(person_labels: np.ndarray, result_labels: np.ndarray,
-                           person_rgb: np.ndarray, result_rgb: np.ndarray,
-                           changed_mask: np.ndarray, *,
-                           person_lab: np.ndarray | None = None,
-                           result_lab: np.ndarray | None = None) -> dict[str, Any]:
-    """Skin and face inside the editable region, in [0, 1]: 1 means nothing went wrong.
+    Two readings, multiplied, both on the pixels the person photo labels face or hair:
 
-    The agnostic mask is the part of the picture the editor is allowed to change, and it
-    is also the only part every other term reads. Exposed arms, the neck, the hands and
-    the chin sit inside it on a sleeveless or open-collar try-on, and a candidate that
-    recolours an arm or drags a collar across the chin changes nothing the other six terms
-    can see.
+    * structure -- SSIM over the region eroded by the window support, because an 11 by 11
+      window straddling the collar mixes the edit into kept pixels and would charge a correct
+      high-collar try-on for doing what it was asked;
+    * colour -- mean CIE76 Delta E over the *uneroded* region, which is what actually reaches
+      the hairline, the jaw and the collar boundary. Delta E is per pixel, so it needs no
+      window and no blind ring.
 
-    Two deterministic readings, multiplied:
-
-    * tone -- the CIE Lab a/b histograms of the candidate's skin pixels inside the mask
-      against the person's **face** skin, which is outside the mask and therefore carries
-      the person's real tone whatever the garment does. Lightness is left out: shading
-      legitimately changes with pose.
-    * face -- SSIM of the face pixels the two pictures share inside the mask, when the
-      face is big enough for the window to mean anything.
-
-    Three earlier choices made the term read backwards. Its reference was the person's own
-    skin *inside* the mask, so a long-sleeved try-on was compared against the bare arms it
-    covered; a proportional collapse penalty was applied on top, so covering the arms cost
-    the term while destroying them did not; and ``SKIN_TONE_ALPHA`` was steep enough to
-    punish ordinary arm shading. Tone now has a reference the edit cannot move, the
-    collapse reading is gone (whether the sleeves match the garment is what
-    ``arm_coverage`` measures), and a candidate with no skin to compare abstains instead of
-    scoring 0.
+    Pixels the candidate's parser assigns to a garment class are excluded from both readings: a
+    collar over the hair is the garment's business, measured by ``garment_patch``, and scoring
+    it here as well would double count one defect.
     """
     person_labels = np.asarray(person_labels)
     result_labels = np.asarray(result_labels)
-    changed = np.asarray(changed_mask, dtype=bool)
-    _require(person_labels.shape[:2] == changed.shape[:2]
-             and result_labels.shape[:2] == changed.shape[:2],
-             "labels and changed mask differ in size")
-    result_skin = np.isin(result_labels, SKIN_LABELS) & changed
-    result_pixels = int(result_skin.sum())
-    # The reference is the part of the person the editor may not touch: the face first,
-    # then the arms, so a cropped or turned face still leaves a tone reading.
-    reference = (person_labels == FACE_LABEL) & ~changed
-    reference_kind = "face"
-    if int(reference.sum()) < SKIN_FACE_MIN_PIXELS:
-        reference = np.isin(person_labels, SKIN_LABELS) & ~changed
-        reference_kind = "skin_outside_mask"
-    reference_pixels = int(reference.sum())
-    detail: dict[str, Any] = {"result_skin_pixels": result_pixels,
-                              "reference_pixels": reference_pixels,
-                              "reference_kind": reference_kind,
-                              "skin_labels": list(SKIN_LABELS)}
-    if reference_pixels < SKIN_FACE_MIN_PIXELS:
-        return {"value": 1.0, "flag": "skin_face_no_reference", "tone": None,
-                "face": None, "tone_distance": None, **detail}
+    _require(person_labels.shape[:2] == result_labels.shape[:2],
+             "person and result labels differ in size")
+    region = np.isin(person_labels, FACE_HAIR_LABELS)
+    region_pixels = int(region.sum())
+    detail: dict[str, Any] = {"region_pixels": region_pixels,
+                              "labels": list(FACE_HAIR_LABELS)}
+    if region_pixels < FACE_HAIR_MIN_PIXELS:
+        # No face or hair on the person: nothing to preserve, and reading 0 would make every
+        # back-turned or cropped candidate look defective.
+        return {"value": 1.0, "flag": "face_hair_no_region", "ssim_mean": None,
+                "delta_e_mean": None, "scored_pixels": 0, **detail}
 
-    person_lab = (cv2.cvtColor(to_rgb_array(person_rgb), cv2.COLOR_RGB2LAB)
-                  if person_lab is None else person_lab)
-    result_lab = (cv2.cvtColor(to_rgb_array(result_rgb), cv2.COLOR_RGB2LAB)
-                  if result_lab is None else result_lab)
-    if result_pixels == 0:
-        # Nothing to compare: a garment that covers the arms is not a tone defect, and
-        # whether the sleeves should be there is the arm term's question.
-        tone, tone_distance = None, None
-        tone_flag = "skin_face_no_result_skin"
-    else:
-        tone_distance = _masked_wasserstein(person_lab, reference, result_lab,
-                                            result_skin, channels=(1, 2))
-        tone = float(math.exp(-SKIN_TONE_ALPHA * tone_distance))
-        tone_flag = ""
+    result_array = to_rgb_array(result_rgb)
+    person_array = to_rgb_array(person_rgb, size=(result_array.shape[1], result_array.shape[0]))
+    garment_on_result = np.isin(result_labels, FACE_HAIR_EXCLUDE_LABELS)
+    scored = region & ~garment_on_result
+    garment_pixels = int((region & garment_on_result).sum())
+    flag = ""
+    if int(scored.sum()) < FACE_HAIR_MIN_PIXELS:
+        # The garment covers the whole face and hair region; fall back to the region itself so
+        # the term still reads something instead of abstaining on a legitimate garment.
+        scored = region
+        flag = "face_hair_region_covered"
 
-    person_face = (person_labels == FACE_LABEL) & changed
-    face_share = float(person_face.mean())
-    face_value: float | None = None
-    if face_share >= FACE_MIN_AREA_SHARE:
-        shared = person_face & (result_labels == FACE_LABEL)
-        region = erode_mask(shared, 2 * SSIM_SUPPORT_RADIUS + 1)
-        if int(region.sum()) < SKIN_FACE_MIN_PIXELS:
-            region = shared
-        face_value = (float(np.clip(ssim_map(result_rgb, person_rgb)[region].mean(), 0.0, 1.0))
-                      if int(region.sum()) >= SKIN_FACE_MIN_PIXELS else 0.0)
+    structure = ssim_map(result_array, person_array)
+    ssim_region = erode_mask(scored, 2 * SSIM_SUPPORT_RADIUS + 1)
+    if int(ssim_region.sum()) < FACE_HAIR_MIN_PIXELS:
+        ssim_region = scored
+        flag = flag or "face_hair_ssim_plain_region"
+    ssim_mean = float(np.clip(structure[ssim_region].mean(), 0.0, 1.0))
 
-    value = (1.0 if tone is None else tone) * (1.0 if face_value is None else face_value)
-    low, high = TERM_RANGES["in_mask_skin_face"]
-    detail.update({"tone": tone, "tone_distance": tone_distance, "face": face_value,
-                   "face_share": face_share})
-    return {"value": float(min(max(value, low), high)), "flag": tone_flag, **detail}
+    person_lab = lab_array(person_array) if person_lab is None else person_lab
+    result_lab = lab_array(result_array) if result_lab is None else result_lab
+    difference = delta_e_map(result_array, person_array, first_lab=result_lab,
+                             second_lab=person_lab)
+    delta_e_mean = float(difference[scored].mean())
+    fidelity = max(0.0, 1.0 - delta_e_mean / KEEP_DELTA_E_MAX)
+
+    value = ssim_mean * fidelity
+    low, high = TERM_RANGES["face_hair_preservation"]
+    detail.update({"ssim_mean": ssim_mean, "delta_e_mean": delta_e_mean,
+                   "colour_fidelity": fidelity, "scored_pixels": int(scored.sum()),
+                   "ssim_pixels": int(ssim_region.sum()), "garment_pixels": garment_pixels})
+    return {"value": float(min(max(value, low), high)), "flag": flag, **detail}
 
 
 def keypoint_retention(person_points: Mapping[str, Mapping[str, float]],
@@ -1956,22 +1997,17 @@ def term_contract() -> dict[str, Any]:
             "calibration": "D_ref = training-fold 5th percentile of D, alpha = log(3) / (p95 - p5); "
                            "fitted inside each CV fold from the stored raw distances",
         },
-        "in_mask_skin_face": {
-            "skin_labels": list(SKIN_LABELS),
-            "face_label": FACE_LABEL,
-            "region": "the changed-area mask, which is the part of the picture the editor may change",
-            "tone": "mean of the CIE Lab a and b histogram Wasserstein distances between the "
-                    "candidate's skin pixels inside the mask and the person's reference skin "
-                    "outside it, mapped by exp(-alpha * D)",
-            "tone_alpha": SKIN_TONE_ALPHA,
-            "tone_reference": "the person's face pixels outside the mask, falling back to the "
-                              "person's arms outside the mask",
-            "face": f"SSIM on the face pixels both pictures share, when the person face inside "
-                    f"the mask covers at least {FACE_MIN_AREA_SHARE} of the frame",
-            "no_collapse_term": "covering the arms is a sleeve-coverage question, measured by "
-                                "arm_coverage; a candidate with no skin to compare reads 1.0",
-            "missing_value": "1.0 with a flag when the person photo has no reference skin outside "
-                             "the mask",
+        "face_hair_preservation": {
+            "region": f"parser face ({FACE_LABEL}) and hair ({HAIR_LABEL}) pixels of the person",
+            "excluded": f"pixels the result parser assigns to {list(FACE_HAIR_EXCLUDE_LABELS)}, "
+                        "so a collar over the hair is not scored twice",
+            "structure": f"SSIM of the person and candidate over the region eroded by the "
+                         f"{SSIM_SUPPORT_RADIUS}-pixel window support, when that leaves "
+                         f"{FACE_HAIR_MIN_PIXELS} pixels",
+            "colour": "mean CIE76 Delta E over the uneroded region, which is what reaches the "
+                      "hairline, jaw and collar boundary",
+            "combination": f"ssim * max(0, 1 - delta_e / {KEEP_DELTA_E_MAX})",
+            "missing_value": "1.0 with a flag when the person photo shows no face or hair",
         },
         "anatomy_mask_quality": {
             "keypoint_weights": dict(ANATOMY_KEYPOINT_WEIGHTS),
@@ -2264,7 +2300,6 @@ class GeometryScorer:
         person_array = to_rgb_array(person, size=(width, height))
         person_lab = lab_array(person_array)
         person_labels, person_confidence = self.parse_labels_with_confidence(person_array)
-        person_histogram_lab = cv2.cvtColor(person_array, cv2.COLOR_RGB2LAB)
         cloth = np.asarray(cloth_mask, dtype=bool)
         flat_region = erode_mask(cloth, PATCH_SIZE + 1)
         if not flat_region.any():
@@ -2275,7 +2310,6 @@ class GeometryScorer:
             "frame": frame,
             "person_array": person_array,
             "person_lab": person_lab,
-            "person_histogram_lab": person_histogram_lab,
             "person_chroma": np.sqrt(person_lab[:, :, 1] ** 2 + person_lab[:, :, 2] ** 2),
             "person_labels": person_labels,
             "person_confidence": person_confidence,
@@ -2395,9 +2429,9 @@ class GeometryScorer:
             colour = lab_colour_term(state["garment_array"], state["flat_region"],
                                      result_array, worn_region,
                                      flat_lab=state["flat_lab"], worn_lab=colour_lab)
-            skin_face = in_mask_skin_face_term(
-                state["person_labels"], labels, state["person_array"], result_array, changed,
-                person_lab=state["person_histogram_lab"], result_lab=colour_lab)
+            face_hair = face_hair_preservation_term(
+                state["person_labels"], labels, state["person_array"], result_array,
+                person_lab=state["person_lab"], result_lab=result_lab)
             anatomy = anatomy_mask_quality_term(state["person_points"], result_points,
                                                 labels, garment_region,
                                                 confidence=confidence)
@@ -2408,7 +2442,7 @@ class GeometryScorer:
                 "kept_area": keep["value"],
                 "garment_patch": garment_result["value"],
                 "lab_colour": colour["value"],
-                "in_mask_skin_face": skin_face["value"],
+                "face_hair_preservation": face_hair["value"],
                 "anatomy_mask_quality": anatomy["value"],
             }
             details = {
@@ -2417,7 +2451,7 @@ class GeometryScorer:
                 "kept_area": keep,
                 "garment_patch": garment_result,
                 "lab_colour": colour,
-                "in_mask_skin_face": skin_face,
+                "face_hair_preservation": face_hair,
                 "anatomy_mask_quality": anatomy,
             }
             rows.append({
