@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 TASK_ID = "T018"
 
 # ---------------------------------------------------------------- term contract
@@ -204,29 +204,16 @@ COLOUR_STRIP_COUNT = 3
 COLOUR_GLOBAL_WEIGHT = 0.4
 COLOUR_STRIP_WEIGHT = 0.6
 COLOUR_MIN_STRIP_PIXELS = 20
-# Similarity = exp(-alpha * D), D being the weighted Lab histogram distance in [0, 1].
-# D stays below ~0.04 on real garment pairs and reaches ~0.15 under a hue rotation, so
-# 20 puts an exact match at 1.0 and a rotated garment near 0.0 while still spreading
-# the real pairs over roughly [0.5, 1.0] instead of the old 0.037-wide band. It is a
-# monotone rescaling, so it cannot change a ranking; the Phase 1 evaluator run
-# refits it on the labelled set so the term's interquartile range spans at least
-# [0.4, 0.9], and only the spread, not the AUROC, moves.
-#
-# Patch 6: no alpha fixes that a plain exp(-alpha * D) is anchored at zero. Matching the
-# 0.02..0.05 band onto [0.9, 0.35] needs alpha ~ 36, which sends a clean D = 0.02 to 0.48
-# instead of 0.9. The shifted form clip(exp(-alpha * (D - D_ref)), 0, 1) is anchored where
-# real pairs live, so the placeholder below puts D = 0.02 at 0.90 and D = 0.05 at 0.35.
-# Calibration rule: D_ref is its 5th percentile of D (so an exact match maps to 1.0) and
-# alpha = log(3) / (p95 - p5) (so the typical spread covers [1.0, 1/3]). The pair below is
-# that rule measured on the 160 graded pictures (Phase 0 ``colour_calibration.full_dev``:
-# p5 = 0.00821, p95 = 0.03198, median = 0.01875, alpha = 46.23).
-#
-# The previous pair, (0.0167, 31.5), sat just below the median, so 41.9% of the 160
-# graded candidates read exactly 1.0 on this term and could not be told apart at all. The
-# audit re-derives the pair inside each training fold from the raw distances it stores per
-# row, so the fold that scores a candidate never saw its own percentile.
-COLOUR_ALPHA = 46.22894598548573
-COLOUR_REFERENCE_DISTANCE = 0.008211377611137218
+# Similarity = 1 - D / COLOUR_ZERO_DISTANCE, clipped to [0, 1]: one number with an
+# obvious meaning, "the distance at which the garment's colour scores nothing". The 160
+# graded pictures put D in [0.0036, 0.0400] (median 0.0187, p95 0.0320), so 0.045 puts a
+# perfect match at 1.0, the median candidate at 0.58 and the worst at 0.11. It replaces a
+# shifted exponential whose slope and reference distance were both fitted inside each CV
+# fold; on those 160 rows the two mappings rank identically (single-term AUROC 0.6022
+# against 0.6024) and the linear one ties fewer pairs (296 of 495 within-input pairs
+# correct against 291, 11 ties removed). The audit refits the one constant per fold as
+# ``p95 / (1 - 1/3)``, the same rule the exponential's two constants came from.
+COLOUR_ZERO_DISTANCE = 0.045
 
 # Pose: COCO keypoint order produced by the container's pose detector.
 KEYPOINT_CONFIDENCE = 0.3
@@ -295,44 +282,6 @@ ARM_SEGMENTS: tuple[str, ...] = ("upper", "fore")
 # median is more than 0.03 away from 1.0 the detector itself is biased and this
 # constant is replaced by the measured median (or by its garment-bin median).
 SHOULDER_TARGET_RATIO = 1.0
-# Three rulers, tried in this order; each is also reported as a non-scoring
-# variant so the order is a measured claim. The head ruler (neck midpoint to nose)
-# is the oldest and the worst: the nose is a face keypoint, the pose detector
-# slides it on generated faces, and on the 160 graded pictures that drove the ratio
-# far enough to pin 57% of the candidates at the -1 floor. Hip width is a body
-# keypoint but scales with the whole body, so a horizontally widened body leaves the
-# ratio unchanged and the corruption ladder caught exactly that. The torso length
-# (shoulder midpoint to hip midpoint) is vertical, so width changes move one operand
-# only, and it never reads the face.
-SHOULDER_RULERS: tuple[str, ...] = ("torso", "hips", "head")
-# Patch 1: the other half of the denominator choice. Every ruler above divides the
-# result's shoulder/torso by the person's, so a result hip keypoint that jumps up under a
-# generated hem shortens the result torso length and reports a 12-21% widening with no
-# body movement at all -- panel-07 read -0.426 and panel-01 -0.371 while visibly clean.
-# The person-anchored width ratio keeps the person's torso length in both denominators and
-# so cancels the result hips completely, and it is gated on the pelvis staying put so a
-# real body move still falls back to the independent ruler.
-SHOULDER_ALIGNED_RULER = "aligned"
-SHOULDER_VARIANTS: tuple[str, ...] = (*SHOULDER_RULERS, SHOULDER_ALIGNED_RULER)
-SHOULDER_INDEPENDENT_RULER = "independent"
-# Which of the two scores: SHOULDER_INDEPENDENT_RULER (the ruler chain above) or
-# SHOULDER_ALIGNED_RULER. Phase 0 measured both on the 160 graded pictures and the aligned
-# ratio wins on three separate readings -- single-term AUROC 0.7785 against 0.7215, the
-# within-input pair accuracy 0.6121 against 0.5758, and the worst clean-panel penalty
-# -0.279 against -0.426 -- while costing 0.007 pooled AUROC, which is noise on 160 rows.
-# The ruler is what GRPO is exposed to on every update, so the false penalties it attaches
-# to clean outputs (panel-01, panel-07) weigh more than the pooled number.
-# The independent chain is still reported under ``variants`` and in the audit's
-# ``ruler_comparison``, and it remains the fallback wherever the pelvis gate refuses.
-SHOULDER_SCORING_RULER: str = SHOULDER_ALIGNED_RULER
-SHOULDER_SCORING_RULER_CHOICES: tuple[str, ...] = (SHOULDER_INDEPENDENT_RULER,
-                                                  SHOULDER_ALIGNED_RULER)
-# How far the hip midpoints may move between the person photo and the result before the
-# pelvis counts as moved, as a fraction of the frame height.
-SHOULDER_HIP_GATE_FRACTION = 0.05
-# The gate's cliff: beyond twice that travel the aligned ruler is refused outright, and
-# between the two limits its confidence fades linearly instead of stepping to zero.
-SHOULDER_SOFT_GATE_FACTOR = 2.0
 
 
 class GeometryTermError(RuntimeError):
@@ -371,11 +320,10 @@ def scale_points_to_frame(points: Mapping[str, Mapping[str, float]],
                           target: tuple[int, int]) -> dict[str, dict[str, float]]:
     """Move keypoints from one frame's resolution onto another's, in place of a copy.
 
-    The person-anchored shoulder ratio divides an absolute width by an absolute width, so
-    it is only meaningful when both widths are measured in the same pixels. Comparing a
-    person pose detected at 1024 by 768 against a result at 768 by 576 moves the hip
-    midpoint by roughly a quarter of the frame and makes the pelvis gate refuse every
-    candidate, which reads as a failed pose check rather than as a unit mismatch.
+    The shoulder ratio divides one absolute width by another, so it is only meaningful
+    when both are measured in the same pixels. Comparing a person pose detected at 1024 by
+    768 against a result at 768 by 576 biases every ratio by three quarters and reads as a
+    narrow-shouldered candidate rather than as a unit mismatch.
     """
     source_height, source_width = (int(source[0]), int(source[1]))
     target_height, target_width = (int(target[0]), int(target[1]))
@@ -636,233 +584,40 @@ def shoulder_width(points: Mapping[str, Mapping[str, float]]) -> float | None:
     return math.dist(left, right)
 
 
-def hip_midpoint(points: Mapping[str, Mapping[str, float]]) -> tuple[float, float] | None:
-    """Midpoint of the two hip keypoints, or None if one is missing."""
-    left = _visible(points, "left_hip")
-    right = _visible(points, "right_hip")
-    if left is None or right is None:
-        return None
-    return ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
+def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
+                             person_points: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
+    """Proportion change of shoulder width, in [-1, 0].
 
+    The ratio is the result's shoulder width over the person's, both measured by the same
+    detector on frames registered to each other, so zoom, crop and translation cancel.
+    This ratio was chosen after Phase 0 measured four rulers on the 160 graded pictures:
+    the person-anchored width won on single-term AUROC (0.778 against 0.722 for the best
+    independent one), on within-input pair accuracy, and on the clean panels the
+    independent rulers wrongly penalised, because a result hip keypoint that jumps under a
+    generated hem appears in neither of its operands.
 
-def pose_ratio(points: Mapping[str, Mapping[str, float]],
-               ruler: str = "head") -> dict[str, Any]:
-    """Scale-free shoulder ratio against a built-in ruler.
+    The penalty is ``-min(1, |log(ratio / target)| / log 2)``: a ratio equal to the target
+    scores 0 and a doubling or a halving scores -1. Working in log scale is what makes
+    widening and narrowing cost the same, which a linear ``|ratio - 1|`` cannot do.
 
-    ``ruler="torso"`` divides the shoulder width by the length from the shoulder
-    midpoint to the hip midpoint, ``ruler="hips"`` by the hip width, ``ruler="head"``
-    by the distance from the shoulder midpoint to the nose. Every one of them
-    cancels zoom, crop and translation. They differ in what they are blind to: hip
-    width scales with the whole body, so a picture whose body was widened
-    horizontally moves both operands and the ratio stays put, while the torso
-    length is a vertical measure and does not; the head ruler reads face keypoints,
-    which the detector slides on generated faces. Both operands must come from the same
-    detector: the person ratio is cached by ``prepare_t018_geometry.py`` from a run
-    of the same detector on the person photo.
-    """
-    left = _visible(points, "left_shoulder")
-    right = _visible(points, "right_shoulder")
-    if left is None or right is None:
-        return {"ratio": None, "ruler": None, "reason": "missing_shoulders"}
-    shoulder = math.dist(left, right)
-    if ruler == "torso":
-        shoulder_mid = ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
-        hip_mid = hip_midpoint(points)
-        if hip_mid is None:
-            return {"ratio": None, "ruler": None, "reason": "missing_hips"}
-        torso = math.dist(shoulder_mid, hip_mid)
-        if shoulder <= 0 or torso <= 1e-6:
-            return {"ratio": None, "ruler": None, "reason": "degenerate_ruler"}
-        return {"ratio": shoulder / torso, "ruler": "shoulder_over_torso", "reason": ""}
-    if ruler == "hips":
-        left_hip = _visible(points, "left_hip")
-        right_hip = _visible(points, "right_hip")
-        if left_hip is None or right_hip is None:
-            return {"ratio": None, "ruler": None, "reason": "missing_hips"}
-        width = math.dist(left_hip, right_hip)
-        if shoulder <= 0 or width <= 1e-6:
-            return {"ratio": None, "ruler": None, "reason": "degenerate_ruler"}
-        return {"ratio": shoulder / width, "ruler": "shoulder_over_hip", "reason": ""}
-    nose = _visible(points, "nose")
-    if nose is None:
-        return {"ratio": None, "ruler": None, "reason": "missing_nose"}
-    neck = ((left[0] + right[0]) / 2.0, (left[1] + right[1]) / 2.0)
-    head = math.dist(neck, nose)
-    if shoulder <= 0 or head <= 1e-6:
-        return {"ratio": None, "ruler": None, "reason": "degenerate_ruler"}
-    return {"ratio": shoulder / head, "ruler": "shoulder_over_neck_nose", "reason": ""}
-
-
-def independent_shoulder_variant(result_points: Mapping[str, Mapping[str, float]],
-                                 person_points: Mapping[str, Mapping[str, float]],
-                                 name: str) -> dict[str, Any]:
-    """One of the three independent rulers, measured on both frames."""
-    result_ratio = pose_ratio(result_points, name)
-    person_ratio = pose_ratio(person_points, name)
-    entry: dict[str, Any] = {
-        "ruler": result_ratio["ruler"] or person_ratio["ruler"],
-        "result_ratio": result_ratio["ratio"],
-        "person_ratio": person_ratio["ratio"],
-        "available": False,
-        "relative": None,
-        "value": None,
-        "reason": result_ratio["reason"] or person_ratio["reason"],
-    }
-    if entry["result_ratio"] is not None and entry["person_ratio"] is not None:
-        relative = entry["result_ratio"] / entry["person_ratio"]
-        entry["relative"] = float(relative)
-        entry["value"] = shoulder_penalty(relative)
-        entry["available"] = True
-    return entry
-
-
-def aligned_shoulder_variant(result_points: Mapping[str, Mapping[str, float]],
-                             person_points: Mapping[str, Mapping[str, float]],
-                             frame_height: float | None) -> dict[str, Any]:
-    """Person-anchored width ratio, in the same entry shape as the independent rulers.
-
-    ``ratio = shoulder_width(result) / shoulder_width(person)``. Dividing both the
-    numerator and the ``person`` half of an independent ratio by the person's torso
-    length leaves this quantity, so the result hip keypoints appear nowhere in it and the
-    upward hip jitter that made clean panels read -0.35 is gone. That also means a whole
-    body that really moved is invisible to it, so the measurement is gated on the pelvis
-    having stayed put: the hip midpoint may travel at most
-    ``SHOULDER_HIP_GATE_FRACTION`` of the frame height between the person photo and the
-    result. ``gate`` records which check ran, so the Phase 0 table can separate a failed
-    gate from a missing keypoint.
-
-    The two frames must share a pixel grid for the gate to mean anything -- the result is
-    pixel-aligned with the person photo by construction, which is the same reason the
-    registered pixels can be compared at all.
+    A missing shoulder on the person photo says nothing about what the edit did -- the
+    detector simply did not see it -- so the term abstains at 0.0. A missing shoulder on
+    the result is a defect of the result and scores the worst value.
     """
     result_width = shoulder_width(result_points)
     person_width = shoulder_width(person_points)
-    entry: dict[str, Any] = {
-        "ruler": "shoulder_over_shoulder",
-        "result_ratio": result_width,
-        "person_ratio": person_width,
-        "available": False,
-        "relative": None,
-        "value": None,
-        "reason": "",
-        "gate": "missing_shoulders",
-    }
-    if result_width is None or person_width is None or person_width <= 1e-6:
-        entry["reason"] = "missing_shoulders"
-        return entry
-    result_hip = hip_midpoint(result_points)
-    person_hip = hip_midpoint(person_points)
-    if frame_height is None:
-        entry["reason"] = "gate_unmeasurable"
-        entry["gate"] = "no_frame_height"
-        return entry
-    if result_hip is None or person_hip is None:
-        entry["reason"] = "gate_unmeasurable"
-        entry["gate"] = "missing_hips"
-        return entry
-    travel = math.dist(result_hip, person_hip)
-    limit = SHOULDER_HIP_GATE_FRACTION * float(frame_height)
-    entry["hip_travel"] = travel
-    entry["hip_gate_limit"] = limit
-    # A hard step at ``limit`` turns a few pixels of generated-hem jitter into a jump
-    # between two rulers that measure different things, and the fit responded by giving
-    # this term weight 0.0 on the within-group pairs. Between one and two gate widths the
-    # person-anchored value is kept but its confidence falls linearly to zero, and
-    # ``shoulder_proportion_term`` spends that confidence on a blend with the chain.
-    gate_weight = 0.0 if limit <= 0.0 else 1.0 - max(0.0, travel / limit - 1.0)
-    gate_weight = float(min(1.0, max(0.0, gate_weight)))
-    entry["gate_weight"] = gate_weight
-    if travel > SHOULDER_SOFT_GATE_FACTOR * limit:
-        entry["reason"] = "hip_gate_failed"
-        entry["gate"] = "failed"
-        return entry
-    entry["gate"] = "passed" if gate_weight >= 1.0 else "soft"
-    relative = result_width / person_width
-    entry["relative"] = float(relative)
-    entry["value"] = shoulder_penalty(relative)
-    entry["available"] = True
-    return entry
-
-
-def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
-                             person_points: Mapping[str, Mapping[str, float]],
-                             ruler: str | None = None, *,
-                             frame_height: float | None = None) -> dict[str, Any]:
-    """Proportion change of shoulder width, in [-1, 0].
-
-    The penalty is ``-min(1, |log(ratio / target)| / log 2)``: a ratio of 1 scores 0
-    and a doubling or a halving scores -1. Working in log scale is what makes widening
-    and narrowing cost the same, which a linear ``|ratio - 1|`` cannot do -- a doubled
-    ratio and a halved one are the same relative error.
-
-    Every ruler is measured on both frames; ``variants`` keeps all of them, the
-    person-anchored ``aligned`` width ratio included, so the offline report can show what
-    each one would have scored even though only one of them scores. ``ruler=None`` scores
-    with ``SHOULDER_SCORING_RULER``: the independent chain, or the aligned ratio when the
-    Phase 0 measurement preferred it, which falls back to the chain whenever its hip gate
-    fails. Naming one of ``SHOULDER_RULERS`` forces that ruler and makes the term
-    unmeasurable when it alone is unavailable; naming ``aligned`` forces it with the same
-    fallback, because a failed hip gate is a reason to distrust the ruler rather than a
-    reason to fail the candidate. ``independent`` names the chain itself, which is what
-    ``ruler=None`` scored before the aligned ratio became the default, so the audit can
-    still read the old table off the same pictures.
-    """
-    _require(ruler is None or ruler in (*SHOULDER_VARIANTS, SHOULDER_INDEPENDENT_RULER),
-             f"unknown shoulder ruler: {ruler}")
-    variants: dict[str, dict[str, Any]] = {
-        name: independent_shoulder_variant(result_points, person_points, name)
-        for name in SHOULDER_RULERS
-    }
-    variants[SHOULDER_ALIGNED_RULER] = aligned_shoulder_variant(
-        result_points, person_points, frame_height)
-
-    if ruler is None:
-        scoring = SHOULDER_SCORING_RULER
-        _require(scoring in SHOULDER_SCORING_RULER_CHOICES,
-                 f"unknown SHOULDER_SCORING_RULER: {scoring}")
-        # The aligned ratio carries the independent chain behind it, because its hip gate
-        # is a reason to distrust the ruler rather than a reason to fail the candidate.
-        order = (SHOULDER_ALIGNED_RULER, *SHOULDER_RULERS) if scoring == SHOULDER_ALIGNED_RULER \
-            else SHOULDER_RULERS
-    elif ruler == SHOULDER_INDEPENDENT_RULER:
-        order = SHOULDER_RULERS
-    else:
-        order = (ruler,) if ruler != SHOULDER_ALIGNED_RULER else \
-            (SHOULDER_ALIGNED_RULER, *SHOULDER_RULERS)
-    chosen = next((name for name in order if variants[name]["available"]), None)
-    gate = variants[SHOULDER_ALIGNED_RULER]["gate"]
-    if chosen is None:
-        # A person photo whose own shoulders the detector could not see says nothing about
-        # what the edit did, so the term abstains rather than scoring the worst value: a
-        # missing shoulder on the person is a pose-detection limit, not a defect the edit
-        # introduced.
-        if variants[SHOULDER_ALIGNED_RULER].get("person_ratio") is None:
-            return {"value": 0.0, "flag": "shoulder_person_unmeasurable", "ruler": None,
-                    "ruler_name": None, "result_ratio": None, "person_ratio": None,
-                    "relative": None, "saturated": False, "aligned_gate": gate,
-                    "fallback_from": None, "variants": variants}
+    measured = {"ruler": "shoulder_over_shoulder", "result_ratio": result_width,
+                "person_ratio": person_width}
+    if person_width is None or person_width <= 1e-6:
+        return {"value": 0.0, "flag": "shoulder_person_unmeasurable",
+                "relative": None, "saturated": False, **measured}
+    if result_width is None or result_width <= 0.0:
         return {"value": WORST_VALUE["shoulder_proportion"], "flag": "shoulder_unmeasurable",
-                "ruler": None, "ruler_name": None, "result_ratio": None,
-                "person_ratio": None, "relative": None, "saturated": True,
-                "aligned_gate": gate, "fallback_from": None, "variants": variants}
-    entry = variants[chosen]
-    value = float(entry["value"])
-    blended_with = None
-    gate_weight = 1.0 if chosen != SHOULDER_ALIGNED_RULER else float(
-        entry.get("gate_weight", 1.0))
-    if chosen == SHOULDER_ALIGNED_RULER and gate_weight < 1.0:
-        # Partial pelvis travel: keep the person-anchored reading to the extent the gate
-        # still trusts it and spend the rest of the weight on the independent chain.
-        chain = next((name for name in SHOULDER_RULERS if variants[name]["available"]), None)
-        if chain is not None:
-            value = gate_weight * value + (1.0 - gate_weight) * float(variants[chain]["value"])
-            blended_with = chain
-    return {"value": value, "flag": "", "ruler": entry["ruler"],
-            "ruler_name": chosen, "result_ratio": entry["result_ratio"],
-            "person_ratio": entry["person_ratio"], "relative": entry["relative"],
-            "saturated": value <= -1.0, "aligned_gate": gate,
-            "gate_weight": gate_weight, "blended_with": blended_with,
-            "fallback_from": order[0] if chosen != order[0] else None, "variants": variants}
+                "relative": None, "saturated": True, **measured}
+    relative = float(result_width / person_width)
+    value = shoulder_penalty(relative)
+    return {"value": value, "flag": "", "relative": relative,
+            "saturated": value <= -1.0, **measured}
 
 
 def shoulder_penalty(relative: float) -> float:
@@ -1481,25 +1236,22 @@ def vertical_strips(region: np.ndarray) -> list[np.ndarray]:
     return strips
 
 
-def colour_similarity(distance: float, *, reference_distance: float | None = None,
-                     alpha: float | None = None) -> float:
-    """The shifted exponential that maps a Lab distance onto [0, 1].
+def colour_similarity(distance: float, *, zero_distance: float | None = None) -> float:
+    """The linear ramp that maps a Lab distance onto [0, 1].
 
-    Kept apart from :func:`lab_colour_term` because the audit refits the pair inside each
-    training fold: the term scores with the frozen constants, the report re-scores the same
-    stored raw distances with the fold's own percentiles.
+    Kept apart from :func:`lab_colour_term` because the audit refits the one constant
+    inside each training fold: the term scores with the frozen distance, the report
+    re-scores the same stored raw distances with the fold's own percentile.
     """
-    reference = COLOUR_REFERENCE_DISTANCE if reference_distance is None else reference_distance
-    slope = COLOUR_ALPHA if alpha is None else alpha
-    shifted = float(distance) - float(reference)
-    if shifted <= 0.0:
-        return 1.0
-    return float(min(1.0, math.exp(-float(slope) * shifted)))
+    zero = COLOUR_ZERO_DISTANCE if zero_distance is None else zero_distance
+    if zero <= 0.0:
+        return float(WORST_VALUE["lab_colour"])
+    return float(min(1.0, max(0.0, 1.0 - float(distance) / float(zero))))
 
 
 def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.ndarray,
-                    worn_region: np.ndarray, *, reference_distance: float | None = None,
-                    alpha: float | None = None, flat_lab: np.ndarray | None = None,
+                    worn_region: np.ndarray, *, zero_distance: float | None = None,
+                    flat_lab: np.ndarray | None = None,
                     worn_lab: np.ndarray | None = None) -> dict[str, Any]:
     """Lab-histogram colour term, in [0, 1], on the whole garment and on vertical strips.
 
@@ -1508,13 +1260,10 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
     box into three horizontal thirds and weighting the strip distance at 0.6 catches
     that, while the global term keeps the plain "wrong colour" case.
 
-    The distance maps to a similarity through the shifted exponential
-    ``clip(exp(-alpha * (D - D_ref)), 0, 1)``. A plain ``exp(-alpha * D)`` is anchored at
-    zero, so a garment pair that really is 0.02 apart cannot be told from a perfect match
-    without sending the whole real range to the floor; anchoring at ``D_ref`` puts the
-    clean pairs near 1.0 and leaves ``alpha`` to set the slope through the band real
-    candidates occupy. Both constants and the raw distances ride along in the details, so
-    the Phase 0 run can report the percentiles it calibrated them from.
+    The distance maps to a similarity through ``clip(1 - D / zero_distance, 0, 1)``: one
+    constant with a readable meaning, the distance at which the colour scores nothing. The
+    frozen constant and the raw distances ride along in the details, so the Phase 0 run can
+    report the percentile it calibrated it from.
     """
     flat_region = np.asarray(flat_region, dtype=bool)
     worn_region = np.asarray(worn_region, dtype=bool)
@@ -1536,10 +1285,8 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
         strip_distances.append(colour_distance(flat_lab, flat_strip, worn_lab, worn_strip)[0])
     strip_distance = (float(np.mean(strip_distances)) if strip_distances else global_distance)
     distance = COLOUR_GLOBAL_WEIGHT * global_distance + COLOUR_STRIP_WEIGHT * strip_distance
-    reference = COLOUR_REFERENCE_DISTANCE if reference_distance is None else reference_distance
-    slope = COLOUR_ALPHA if alpha is None else alpha
-    shifted = distance - reference
-    value = colour_similarity(distance, reference_distance=reference, alpha=slope)
+    zero = COLOUR_ZERO_DISTANCE if zero_distance is None else zero_distance
+    value = colour_similarity(distance, zero_distance=zero)
     low, high = TERM_RANGES["lab_colour"]
     return {
         "value": float(min(max(value, low), high)),
@@ -1548,9 +1295,7 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
         "distance_global": global_distance,
         "distance_strips": strip_distance,
         "distance": distance,
-        "distance_shifted": shifted,
-        "alpha": slope,
-        "reference_distance": reference,
+        "zero_distance": zero,
         "strips_used": len(strip_distances),
         "flat_pixels": int(flat_region.sum()),
         "worn_pixels": int(worn_region.sum()),
@@ -1605,23 +1350,12 @@ def term_contract() -> dict[str, Any]:
             "expected_area_share": list(MASK_AREA_RANGE),
         },
         "shoulder_proportion": {
-            "rulers_in_order": list(SHOULDER_RULERS),
-            "rulers": {
-                "torso": "shoulder width / shoulder-midpoint to hip-midpoint distance",
-                "hips": "shoulder width / hip width",
-                "head": "shoulder width / shoulder-midpoint to nose distance",
-                "aligned": "shoulder width on the result / shoulder width on the person, "
-                            "gated on the hip midpoints staying put",
-            },
-            "ruler_policy": "first usable ruler of the order, every ruler is also reported as a "
-                            "non-scoring variant",
-            "scoring_ruler": SHOULDER_SCORING_RULER,
-            "scoring_ruler_choices": list(SHOULDER_SCORING_RULER_CHOICES),
-            "aligned_gate": f"hip midpoints within {SHOULDER_HIP_GATE_FRACTION} of the frame "
-                            "height, else the independent ruler chain scores",
+            "ruler": "shoulder width on the result / shoulder width on the person, both from "
+                      "the same detector on frames registered to each other",
             "target_ratio": SHOULDER_TARGET_RATIO,
-            "penalty": "-min(1, |log(result/person / target)| / log(2))",
-            "missing_value": "-1 when no ruler is usable on either frame",
+            "penalty": "-min(1, |log(ratio / target)| / log(2))",
+            "missing_value": "-1 when the result's shoulders are missing, 0 when the person "
+                              "photo's are",
         },
         "arm_coverage": {
             "samples_per_arm": SLEEVE_SAMPLES,
@@ -1705,11 +1439,10 @@ def term_contract() -> dict[str, Any]:
             "strips": COLOUR_STRIP_COUNT,
             "strip_weights": [COLOUR_GLOBAL_WEIGHT, COLOUR_STRIP_WEIGHT],
             "min_strip_pixels": COLOUR_MIN_STRIP_PIXELS,
-            "alpha": COLOUR_ALPHA,
-            "reference_distance": COLOUR_REFERENCE_DISTANCE,
-            "similarity": "clip(exp(-alpha * (D - D_ref)), 0, 1)",
-            "calibration": "D_ref = training-fold 5th percentile of D, alpha = log(3) / (p95 - p5); "
-                           "fitted inside each CV fold from the stored raw distances",
+            "zero_distance": COLOUR_ZERO_DISTANCE,
+            "similarity": "clip(1 - D / zero_distance, 0, 1)",
+            "calibration": "zero_distance = training-fold p95 / (1 - 1/3); fitted inside each "
+                           "CV fold from the stored raw distances",
         },
         "parser": {"classes": list(PARSER_CLASSES), "input_size": list(PARSER_SIZE)},
         "pose": {
@@ -2091,12 +1824,7 @@ class GeometryScorer:
             changed = masks[index]
             result_array = result_arrays[index]
             result_points = poses[index]
-            shoulder = shoulder_proportion_term(
-                result_points, state["person_points"], frame_height=float(height)
-            ) if result_points else {
-                "value": WORST_VALUE["shoulder_proportion"], "flag": "shoulder_unmeasurable",
-                "result_ratio": None,
-                "person_ratio": pose_ratio(state["person_points"])["ratio"], "ruler": None}
+            shoulder = shoulder_proportion_term(result_points, state["person_points"])
             arms = arm_coverage_term(result_points, labels, str(sample["sleeve_bin_label"]),
                                      state["person_points"],
                                      expected=sample.get("sleeve_expected"))
