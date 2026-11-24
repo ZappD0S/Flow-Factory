@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""T018 geometric virtual try-on reward: seven measured terms, one weighted sum.
+"""T018 geometric virtual try-on reward: five measured terms, one weighted sum.
 
 The reward is reference-free at scoring time. It reads the candidate picture
 (``image``), the person photo and the flat garment photo (``condition_images``),
@@ -11,8 +11,7 @@ geometry named in the sample ``metadata``). Ground truth was used once, offline,
 measure that coverage; the sleeve-length bin is read too, but only for reporting.
 
 R = b + w1 * shoulder_proportion + w2 * arm_coverage + w3 * kept_area
-      + w4 * garment_patch + w5 * lab_colour
-      + w6 * in_mask_skin_face + w7 * anatomy_mask_quality,
+      + w4 * garment_patch + w5 * lab_colour,
 with every weight enforced non-negative.
 
 See ``geometry_terms.py`` for the term definitions and the unit tests in
@@ -85,7 +84,7 @@ def _load_weights_file(path: str | Path) -> dict[str, float]:
 
 
 class T018GeometricRewardModel(GroupwiseRewardModel):
-    """Groupwise geometric reward: seven measured terms and non-negative weights."""
+    """Groupwise geometric reward: five measured terms and non-negative weights."""
 
     required_fields = ("image",)
     use_tensor_inputs = False

@@ -9,7 +9,7 @@ functions in the first half of this module are pure numpy/OpenCV operations on
 images, masks and keypoints, so that the reward model, the offline evaluator and
 the unit tests all compute the same numbers. The second half holds
 :class:`GeometryScorer`, a thin holder for the three frozen models (pose, human
-parser, patch features) plus the per-sample combination of the seven terms.
+parser, patch features) plus the per-sample combination of the five terms.
 
 Nothing here reads ground truth. The ground truth is used exactly once, by
 ``scripts/prepare_t018_geometry.py``, to measure the arm coverage of a garment.
@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TASK_ID = "T018"
 
 # ---------------------------------------------------------------- term contract
@@ -41,8 +41,6 @@ TERM_NAMES: tuple[str, ...] = (
     "kept_area",
     "garment_patch",
     "lab_colour",
-    "in_mask_skin_face",
-    "anatomy_mask_quality",
 )
 DEFAULT_WEIGHTS: dict[str, float] = {
     "shoulder_proportion": 1.0,
@@ -50,8 +48,6 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "kept_area": 1.0,
     "garment_patch": 1.0,
     "lab_colour": 0.5,
-    "in_mask_skin_face": 0.5,
-    "anatomy_mask_quality": 0.5,
 }
 DEFAULT_BIAS = 0.0
 # Penalty terms bottom out at -1, similarity terms at 0, so in every case the worst
@@ -62,8 +58,6 @@ TERM_RANGES: dict[str, tuple[float, float]] = {
     "kept_area": (0.0, 1.0),
     "garment_patch": (0.0, 1.0),
     "lab_colour": (0.0, 1.0),
-    "in_mask_skin_face": (0.0, 1.0),
-    "anatomy_mask_quality": (0.0, 1.0),
 }
 WORST_VALUE: dict[str, float] = {name: TERM_RANGES[name][0] for name in TERM_NAMES}
 
@@ -233,46 +227,6 @@ COLOUR_MIN_STRIP_PIXELS = 20
 # row, so the fold that scores a candidate never saw its own percentile.
 COLOUR_ALPHA = 46.22894598548573
 COLOUR_REFERENCE_DISTANCE = 0.008211377611137218
-
-# Terms 6 and 7 (Phase 2). Both are quality terms in [0, 1], 1 meaning no defect seen.
-# Every term above compares only inside the region the editor may change, which is why a
-# candidate that sharpens the garment print while melting a hand or recolouring a neck
-# still scored well. These two read the same three frozen models the other terms already
-# load, so they add no checkpoint.
-SKIN_LABELS: tuple[int, ...] = (12, 13)  # arms, hands
-FACE_LABEL = 1
-SKIN_FACE_MIN_PIXELS = MIN_REGION_PIXELS
-# The face is only scored when the edit reaches at least this share of the frame: below it
-# the face crop is too small for SSIM to say anything.
-FACE_MIN_AREA_SHARE = 0.005
-# CIE Lab a/b Wasserstein distance -> similarity. The reference is the person's own face,
-# so a real candidate sits near 0.02-0.04 and the decay has to be shallow enough that
-# ordinary arm shading survives it: at alpha 40 a distance of 0.05 read 0.14, which put
-# the term at 0.337 AUROC, worse than chance.
-SKIN_TONE_ALPHA = 12.0
-ANATOMY_KEYPOINT_WEIGHTS: dict[str, float] = {
-    "nose": 1.0,
-    "left_shoulder": 1.0,
-    "right_shoulder": 1.0,
-    "left_elbow": 1.5,
-    "right_elbow": 1.5,
-    "left_wrist": 2.0,
-    "right_wrist": 2.0,
-}
-# The parser's own maximum softmax probability, averaged over the pixels the term reads.
-# A melted cloth/skin hybrid is exactly the case where the parser cannot choose a class,
-# so its margin is the cheapest uncertainty signal available without a new model.
-# SegFormer's max-softmax over garment and skin pixels sits between 0.85 and 0.99 on real
-# candidates, so a [0.5, 0.9] band clipped almost everything to 1.0 (measured spread 0.0115,
-# ten to twenty times smaller than the other terms) and left the fit amplifying noise.
-PARSER_MARGIN_FLOOR = 0.80
-PARSER_MARGIN_TARGET = 0.98
-# ViTPose joint confidence saturates the same way, so retention is read on its own band.
-RETENTION_FLOOR = 0.60
-RETENTION_TARGET = 0.95
-# A garment mask broken into pieces is a boundary artifact; components smaller than this
-# share of the largest one are counted as fragmentation.
-FRAGMENT_MIN_SHARE = 0.005
 
 # Pose: COCO keypoint order produced by the container's pose detector.
 KEYPOINT_CONFIDENCE = 0.3
@@ -879,8 +833,9 @@ def shoulder_proportion_term(result_points: Mapping[str, Mapping[str, float]],
     gate = variants[SHOULDER_ALIGNED_RULER]["gate"]
     if chosen is None:
         # A person photo whose own shoulders the detector could not see says nothing about
-        # what the edit did, so the term abstains instead of flooring: the confidence loss
-        # is measured by ``anatomy_mask_quality``, which is where it belongs.
+        # what the edit did, so the term abstains rather than scoring the worst value: a
+        # missing shoulder on the person is a pose-detection limit, not a defect the edit
+        # introduced.
         if variants[SHOULDER_ALIGNED_RULER].get("person_ratio") is None:
             return {"value": 0.0, "flag": "shoulder_person_unmeasurable", "ruler": None,
                     "ruler_name": None, "result_ratio": None, "person_ratio": None,
@@ -1602,206 +1557,6 @@ def lab_colour_term(flat_rgb: np.ndarray, flat_region: np.ndarray, worn_rgb: np.
     }
 
 
-# ---------------------------------------------------------------------- realism
-
-
-def _masked_wasserstein(first_lab: np.ndarray, first_region: np.ndarray,
-                        second_lab: np.ndarray, second_region: np.ndarray,
-                        channels: Sequence[int]) -> float:
-    """Mean Wasserstein distance of the given Lab channels over two masked regions."""
-    distances = []
-    for channel in channels:
-        left = first_lab[:, :, channel][np.asarray(first_region, dtype=bool)]
-        right = second_lab[:, :, channel][np.asarray(second_region, dtype=bool)]
-        if left.size == 0 or right.size == 0:
-            continue
-        distances.append(histogram_wasserstein(left.astype(np.float32),
-                                               right.astype(np.float32), HIST_BINS))
-    return float(np.mean(distances)) if distances else 1.0
-
-
-def in_mask_skin_face_term(person_labels: np.ndarray, result_labels: np.ndarray,
-                           person_rgb: np.ndarray, result_rgb: np.ndarray,
-                           changed_mask: np.ndarray, *,
-                           person_lab: np.ndarray | None = None,
-                           result_lab: np.ndarray | None = None) -> dict[str, Any]:
-    """Skin and face inside the editable region, in [0, 1]: 1 means nothing went wrong.
-
-    The agnostic mask is the part of the picture the editor is allowed to change, and it
-    is also the only part every other term reads. Exposed arms, the neck, the hands and
-    the chin sit inside it on a sleeveless or open-collar try-on, and a candidate that
-    recolours an arm or drags a collar across the chin changes nothing the other six terms
-    can see.
-
-    Two deterministic readings, multiplied:
-
-    * tone -- the CIE Lab a/b histograms of the candidate's skin pixels inside the mask
-      against the person's **face** skin, which is outside the mask and therefore carries
-      the person's real tone whatever the garment does. Lightness is left out: shading
-      legitimately changes with pose.
-    * face -- SSIM of the face pixels the two pictures share inside the mask, when the
-      face is big enough for the window to mean anything.
-
-    Three earlier choices made the term read backwards. Its reference was the person's own
-    skin *inside* the mask, so a long-sleeved try-on was compared against the bare arms it
-    covered; a proportional collapse penalty was applied on top, so covering the arms cost
-    the term while destroying them did not; and ``SKIN_TONE_ALPHA`` was steep enough to
-    punish ordinary arm shading. Tone now has a reference the edit cannot move, the
-    collapse reading is gone (whether the sleeves match the garment is what
-    ``arm_coverage`` measures), and a candidate with no skin to compare abstains instead of
-    scoring 0.
-    """
-    person_labels = np.asarray(person_labels)
-    result_labels = np.asarray(result_labels)
-    changed = np.asarray(changed_mask, dtype=bool)
-    _require(person_labels.shape[:2] == changed.shape[:2]
-             and result_labels.shape[:2] == changed.shape[:2],
-             "labels and changed mask differ in size")
-    result_skin = np.isin(result_labels, SKIN_LABELS) & changed
-    result_pixels = int(result_skin.sum())
-    # The reference is the part of the person the editor may not touch: the face first,
-    # then the arms, so a cropped or turned face still leaves a tone reading.
-    reference = (person_labels == FACE_LABEL) & ~changed
-    reference_kind = "face"
-    if int(reference.sum()) < SKIN_FACE_MIN_PIXELS:
-        reference = np.isin(person_labels, SKIN_LABELS) & ~changed
-        reference_kind = "skin_outside_mask"
-    reference_pixels = int(reference.sum())
-    detail: dict[str, Any] = {"result_skin_pixels": result_pixels,
-                              "reference_pixels": reference_pixels,
-                              "reference_kind": reference_kind,
-                              "skin_labels": list(SKIN_LABELS)}
-    if reference_pixels < SKIN_FACE_MIN_PIXELS:
-        return {"value": 1.0, "flag": "skin_face_no_reference", "tone": None,
-                "face": None, "tone_distance": None, **detail}
-
-    person_lab = (cv2.cvtColor(to_rgb_array(person_rgb), cv2.COLOR_RGB2LAB)
-                  if person_lab is None else person_lab)
-    result_lab = (cv2.cvtColor(to_rgb_array(result_rgb), cv2.COLOR_RGB2LAB)
-                  if result_lab is None else result_lab)
-    if result_pixels == 0:
-        # Nothing to compare: a garment that covers the arms is not a tone defect, and
-        # whether the sleeves should be there is the arm term's question.
-        tone, tone_distance = None, None
-        tone_flag = "skin_face_no_result_skin"
-    else:
-        tone_distance = _masked_wasserstein(person_lab, reference, result_lab,
-                                            result_skin, channels=(1, 2))
-        tone = float(math.exp(-SKIN_TONE_ALPHA * tone_distance))
-        tone_flag = ""
-
-    person_face = (person_labels == FACE_LABEL) & changed
-    face_share = float(person_face.mean())
-    face_value: float | None = None
-    if face_share >= FACE_MIN_AREA_SHARE:
-        shared = person_face & (result_labels == FACE_LABEL)
-        region = erode_mask(shared, 2 * SSIM_SUPPORT_RADIUS + 1)
-        if int(region.sum()) < SKIN_FACE_MIN_PIXELS:
-            region = shared
-        face_value = (float(np.clip(ssim_map(result_rgb, person_rgb)[region].mean(), 0.0, 1.0))
-                      if int(region.sum()) >= SKIN_FACE_MIN_PIXELS else 0.0)
-
-    value = (1.0 if tone is None else tone) * (1.0 if face_value is None else face_value)
-    low, high = TERM_RANGES["in_mask_skin_face"]
-    detail.update({"tone": tone, "tone_distance": tone_distance, "face": face_value,
-                   "face_share": face_share})
-    return {"value": float(min(max(value, low), high)), "flag": tone_flag, **detail}
-
-
-def keypoint_retention(person_points: Mapping[str, Mapping[str, float]],
-                       result_points: Mapping[str, Mapping[str, float]]) -> dict[str, Any]:
-    """Per-joint confidence kept by the candidate, weighted towards elbows and wrists.
-
-    A joint the person photo showed confidently and the candidate lost is the melted-arm
-    case the T019 review named on panel 11. A joint the person photo never had is left out
-    rather than counted as a loss, so a side-on pose is not penalised twice.
-    """
-    weighted: list[tuple[float, float]] = []
-    per_joint: dict[str, Any] = {}
-    for name, weight in ANATOMY_KEYPOINT_WEIGHTS.items():
-        person_row = person_points.get(name) or {}
-        result_row = result_points.get(name) or {}
-        person_score = float(person_row.get("score", 0.0))
-        result_score = float(result_row.get("score", 0.0))
-        visible = person_score >= KEYPOINT_CONFIDENCE
-        retained = min(1.0, result_score / max(person_score, 1e-6)) if visible else None
-        per_joint[name] = {"person": person_score, "result": result_score,
-                           "retained": retained}
-        if retained is not None:
-            weighted.append((float(weight), float(retained)))
-    if not weighted:
-        return {"retention": None, "visible_joints": 0, "per_joint": per_joint}
-    total = sum(weight for weight, _ in weighted)
-    retention = sum(weight * value for weight, value in weighted) / total
-    return {"retention": float(retention), "visible_joints": len(weighted),
-            "per_joint": per_joint}
-
-
-def garment_fragmentation(mask: np.ndarray) -> dict[str, float]:
-    """Share of a garment mask that sits in components far smaller than its largest."""
-    binary = np.asarray(mask, dtype=np.uint8)
-    total = int(binary.sum())
-    if total == 0:
-        return {"fragmentation": 0.0, "components": 0.0, "tiny_share": 0.0}
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    areas = np.asarray([stats[index, cv2.CC_STAT_AREA]
-                        for index in range(1, count)], dtype=np.float64)
-    if areas.size <= 1:
-        return {"fragmentation": 0.0, "components": float(areas.size), "tiny_share": 0.0}
-    largest = float(areas.max())
-    tiny = areas < FRAGMENT_MIN_SHARE * largest
-    return {"fragmentation": float(areas[tiny].sum() / total),
-            "components": float(areas.size), "tiny_share": float(tiny.mean())}
-
-
-def anatomy_mask_quality_term(person_points: Mapping[str, Mapping[str, float]],
-                              result_points: Mapping[str, Mapping[str, float]],
-                              labels: np.ndarray, garment_mask: np.ndarray,
-                              confidence: np.ndarray | None = None) -> dict[str, Any]:
-    """Anatomical and mask quality, in [0, 1]: 1 means no structural damage seen.
-
-    ``shoulder_proportion`` deliberately abstains when a keypoint goes missing, because a
-    missing shoulder is not a proportion. The damage it abstains from has to be measured
-    somewhere, and this is that place: the weighted share of pose confidence the candidate
-    kept, times the parser's own confidence over the garment and skin pixels, minus a
-    penalty for a garment mask broken into pieces.
-    """
-    joints = keypoint_retention(person_points, result_points)
-    garment_share = float(np.isin(np.asarray(labels), WORN_MASK_GARMENT_LABELS).mean())
-    skin_share = float(np.isin(np.asarray(labels), SKIN_LABELS).mean())
-    foreground = garment_share + skin_share
-    margin_value: float | None = None
-    if confidence is not None and foreground > 0.0:
-        foreground_mask = (np.isin(np.asarray(labels), WORN_MASK_GARMENT_LABELS)
-                           | np.isin(np.asarray(labels), SKIN_LABELS))
-        margin = float(np.asarray(confidence)[foreground_mask].mean())
-        span = PARSER_MARGIN_TARGET - PARSER_MARGIN_FLOOR
-        margin_value = float(np.clip((margin - PARSER_MARGIN_FLOOR) / span, 0.0, 1.0))
-        margin_raw = margin
-    else:
-        margin_raw = None
-    fragments = garment_fragmentation(garment_mask)
-    quality = 1.0 - fragments["fragmentation"]
-    if margin_value is not None:
-        quality *= margin_value
-    retention_raw = joints["retention"]
-    # A kept share of 0.85 is an ordinary candidate and a share of 0.6 is a melted arm;
-    # without its own band the 0.85 sat next to 0.95 and the term could not tell them apart.
-    span = RETENTION_TARGET - RETENTION_FLOOR
-    retention = (None if retention_raw is None
-                 else float(np.clip((retention_raw - RETENTION_FLOOR) / span, 0.0, 1.0)))
-    value = quality if retention is None else 0.6 * retention + 0.4 * quality
-    low, high = TERM_RANGES["anatomy_mask_quality"]
-    return {"value": float(min(max(value, low), high)),
-            "flag": "" if retention is not None else "anatomy_no_visible_joints",
-            "retention": retention, "retention_raw": retention_raw,
-            "parser_margin": margin_raw,
-            "margin_quality": margin_value, "fragmentation": fragments["fragmentation"],
-            "fragment_quality": quality, "visible_joints": joints["visible_joints"],
-            "joints": joints["per_joint"], "garment_share": garment_share,
-            "skin_share": skin_share}
-
-
 # ----------------------------------------------------------------------- combine
 
 
@@ -1955,35 +1710,6 @@ def term_contract() -> dict[str, Any]:
             "similarity": "clip(exp(-alpha * (D - D_ref)), 0, 1)",
             "calibration": "D_ref = training-fold 5th percentile of D, alpha = log(3) / (p95 - p5); "
                            "fitted inside each CV fold from the stored raw distances",
-        },
-        "in_mask_skin_face": {
-            "skin_labels": list(SKIN_LABELS),
-            "face_label": FACE_LABEL,
-            "region": "the changed-area mask, which is the part of the picture the editor may change",
-            "tone": "mean of the CIE Lab a and b histogram Wasserstein distances between the "
-                    "candidate's skin pixels inside the mask and the person's reference skin "
-                    "outside it, mapped by exp(-alpha * D)",
-            "tone_alpha": SKIN_TONE_ALPHA,
-            "tone_reference": "the person's face pixels outside the mask, falling back to the "
-                              "person's arms outside the mask",
-            "face": f"SSIM on the face pixels both pictures share, when the person face inside "
-                    f"the mask covers at least {FACE_MIN_AREA_SHARE} of the frame",
-            "no_collapse_term": "covering the arms is a sleeve-coverage question, measured by "
-                                "arm_coverage; a candidate with no skin to compare reads 1.0",
-            "missing_value": "1.0 with a flag when the person photo has no reference skin outside "
-                             "the mask",
-        },
-        "anatomy_mask_quality": {
-            "keypoint_weights": dict(ANATOMY_KEYPOINT_WEIGHTS),
-            "retention": "per visible person joint, min(1, result confidence / person confidence), "
-                         f"weighted by joint then rescaled from [{RETENTION_FLOOR}, "
-                         f"{RETENTION_TARGET}] to [0, 1]",
-            "parser_margin": f"mean maximum softmax probability over garment and skin pixels, "
-                            f"rescaled from [{PARSER_MARGIN_FLOOR}, {PARSER_MARGIN_TARGET}] to [0, 1]",
-            "fragmentation": f"share of the worn garment mask in components smaller than "
-                            f"{FRAGMENT_MIN_SHARE} of the largest one",
-            "combination": "0.6 * retention + 0.4 * margin_quality * (1 - fragmentation)",
-            "missing_value": "the quality half alone with a flag when no person joint is visible",
         },
         "parser": {"classes": list(PARSER_CLASSES), "input_size": list(PARSER_SIZE)},
         "pose": {
@@ -2293,7 +2019,7 @@ class GeometryScorer:
                      sleeve_bin_label: str, person_points: Mapping[str, Mapping[str, float]],
                      sleeve_expected: Mapping[str, float | None] | None = None,
                      person_available: bool = True) -> dict[str, Any]:
-        """Compute the seven terms and the combined score for one candidate."""
+        """Compute the five terms and the combined score for one candidate."""
         return self.score_batch(
             [{"result": result, "changed_mask": changed_mask,
               "sleeve_bin_label": sleeve_bin_label, "sleeve_expected": sleeve_expected,
@@ -2361,7 +2087,7 @@ class GeometryScorer:
         count = len(samples)
         rows: list[dict[str, Any]] = []
         for index, sample in enumerate(samples):
-            labels, confidence = parsed[index]
+            labels = parsed[index][0]
             changed = masks[index]
             result_array = result_arrays[index]
             result_points = poses[index]
@@ -2395,12 +2121,6 @@ class GeometryScorer:
             colour = lab_colour_term(state["garment_array"], state["flat_region"],
                                      result_array, worn_region,
                                      flat_lab=state["flat_lab"], worn_lab=colour_lab)
-            skin_face = in_mask_skin_face_term(
-                state["person_labels"], labels, state["person_array"], result_array, changed,
-                person_lab=state["person_histogram_lab"], result_lab=colour_lab)
-            anatomy = anatomy_mask_quality_term(state["person_points"], result_points,
-                                                labels, garment_region,
-                                                confidence=confidence)
 
             values = {
                 "shoulder_proportion": shoulder["value"],
@@ -2408,8 +2128,6 @@ class GeometryScorer:
                 "kept_area": keep["value"],
                 "garment_patch": garment_result["value"],
                 "lab_colour": colour["value"],
-                "in_mask_skin_face": skin_face["value"],
-                "anatomy_mask_quality": anatomy["value"],
             }
             details = {
                 "shoulder_proportion": shoulder,
@@ -2417,8 +2135,6 @@ class GeometryScorer:
                 "kept_area": keep,
                 "garment_patch": garment_result,
                 "lab_colour": colour,
-                "in_mask_skin_face": skin_face,
-                "anatomy_mask_quality": anatomy,
             }
             rows.append({
                 "terms": values,
