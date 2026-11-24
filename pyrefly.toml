@@ -1,0 +1,25 @@
+# Type checking for the files this fork changed relative to `upstream/main`, and nothing else.
+# Regenerate the list with:
+#   git diff --name-only $(git merge-base HEAD upstream/main)..HEAD
+# The rest of this tree is upstream code (it vendors a full copy of diffusers), so it is
+# deliberately out of scope: check it upstream, not here.
+preset = "default"
+python-version = "3.12"
+project-includes = [
+    "src/flow_factory/hparams/model_args.py",
+    "src/flow_factory/hparams/reward_args.py",
+    "src/flow_factory/logger/formatting.py",
+    "src/flow_factory/models/flux/flux2.py",
+    "src/flow_factory/models/flux/flux2_klein.py",
+    "src/flow_factory/rewards/__init__.py",
+    "src/flow_factory/rewards/geometric_reward_t018.py",
+    "src/flow_factory/rewards/geometry_terms.py",
+    "src/flow_factory/rewards/physical_reward_t009.py",
+    "src/flow_factory/rewards/rational_rewards_edit.py",
+    "src/flow_factory/rewards/rational_rewards_vto.py",
+    "src/flow_factory/rewards/registry.py",
+    "src/flow_factory/rewards/reward_processor.py",
+    "src/flow_factory/rewards/target_color.py",
+]
+search-path = ["src"]
+project-excludes = ["diffusers/**", "dataset/**", "examples/**", "inference/**", "reward_server/**"]
