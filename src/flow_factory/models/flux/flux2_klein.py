@@ -44,6 +44,7 @@ from ...utils.image import (
     is_image,
     is_image_batch,
     is_multi_image_batch,
+    select_condition_images,
     standardize_image_batch,
 )
 from ...utils.trajectory_collector import (
@@ -249,13 +250,10 @@ class Flux2KleinAdapter(BaseAdapter):
 
         # Determine which images to VAE-encode
         indices = self.conditioning_image_indices
-        if indices is not None:
-            selected_condition_images_tensors = [
-                [t[i] for i in indices if 0 <= i < len(t)]
-                for t in condition_image_tensors
-            ]
-        else:
-            selected_condition_images_tensors = condition_image_tensors
+        selected_condition_images_tensors = select_condition_images(
+            condition_image_tensors=condition_image_tensors,
+            indices=indices,
+        )
 
         image_latents_list = []
         image_latent_ids_list = []

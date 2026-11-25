@@ -31,7 +31,6 @@ from .reward_processor import (
     RewardBuffer,
     RewardProcessor,
 )
-from .target_color import TargetColorRewardModel
 
 __all__ = [
     # Base classes
@@ -41,7 +40,6 @@ __all__ = [
     "RewardModelOutput",
     "RewardProcessor",
     "RewardBuffer",
-    "TargetColorRewardModel",
     # Registry
     "get_reward_model_class",
     "list_registered_reward_models",

@@ -29,7 +29,6 @@ logger = setup_logger(__name__)
 # Reward Model Registry Storage
 _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     "target_color": "flow_factory.rewards.target_color.TargetColorRewardModel",
-    "target_color_reward": "flow_factory.rewards.target_color.TargetColorRewardModel",
     "pure_green": "flow_factory.rewards.target_color.TargetColorRewardModel",
     "pickscore": "flow_factory.rewards.pick_score.PickScoreRewardModel",
     "pickscore_rank": "flow_factory.rewards.pick_score.PickScoreRankRewardModel",

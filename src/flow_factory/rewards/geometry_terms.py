@@ -217,17 +217,6 @@ COLOUR_ZERO_DISTANCE = 0.045
 
 # Pose: COCO keypoint order produced by the container's pose detector.
 KEYPOINT_CONFIDENCE = 0.3
-COCO_KEYPOINT_INDEX: dict[str, int] = {
-    "nose": 0,
-    "left_shoulder": 5,
-    "right_shoulder": 6,
-    "left_elbow": 7,
-    "right_elbow": 8,
-    "left_wrist": 9,
-    "right_wrist": 10,
-    "left_hip": 11,
-    "right_hip": 12,
-}
 COCO_KEYPOINT_ORDER: tuple[str, ...] = (
     "nose",
     "left_eye",
@@ -683,14 +672,13 @@ def sleeve_fraction(label_map: np.ndarray, elbow: tuple[float, float],
     }
 
 
-def sleeve_bin(c_upper: float | None, c_fore: float | None, agree: bool = True) -> str:
+def sleeve_bin(c_upper: float | None, c_fore: float | None) -> str:
     """Three-way sleeve length bin from the ground-truth measurement.
 
-    ``agree`` records whether the two arms measured alike; a disagreement is
-    flagged by the caller but no longer forces a hand check, because both arms
-    wear the same sleeve and the mean is the better estimate of it.
+    Both arms wear the same sleeve, so the mean of the two measurements is the
+    estimate and an arm disagreement no longer forces a hand check; the caller
+    still records ``agree`` in the sleeve record for the report.
     """
-    del agree
     if c_upper is None or c_fore is None:
         return "review"
     if c_fore >= SLEEVE_BIN_LONG_FOREARM:
@@ -888,7 +876,7 @@ def ground_truth_sleeve(label_map: np.ndarray,
         "arms_measured": len(fore),
         "agree": agree,
         "per_side": side_fractions,
-        "bin": sleeve_bin(c_upper, c_fore, agree),
+        "bin": sleeve_bin(c_upper, c_fore),
     }
 
 
@@ -1722,8 +1710,6 @@ class GeometryScorer:
         height, width = frame
         person_array = to_rgb_array(person, size=(width, height))
         person_lab = lab_array(person_array)
-        person_labels, person_confidence = self.parse_labels_with_confidence(person_array)
-        person_histogram_lab = cv2.cvtColor(person_array, cv2.COLOR_RGB2LAB)
         cloth = np.asarray(cloth_mask, dtype=bool)
         flat_region = erode_mask(cloth, PATCH_SIZE + 1)
         if not flat_region.any():
@@ -1734,10 +1720,7 @@ class GeometryScorer:
             "frame": frame,
             "person_array": person_array,
             "person_lab": person_lab,
-            "person_histogram_lab": person_histogram_lab,
             "person_chroma": np.sqrt(person_lab[:, :, 1] ** 2 + person_lab[:, :, 2] ** 2),
-            "person_labels": person_labels,
-            "person_confidence": person_confidence,
             "person_points": scale_points_to_frame(person_points,
                                                    frame_shape(person), frame),
             "garment_array": garment_array,

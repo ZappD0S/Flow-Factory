@@ -689,6 +689,41 @@ def pil_image_to_base64(image: Image.Image, format: str = "JPEG") -> str:
 
 
 # ----------------------------------- Standardization --------------------------------------
+def select_condition_images(
+    condition_image_tensors: List[List[torch.Tensor]],
+    indices: List[int] | None,
+) -> List[List[torch.Tensor]]:
+    """
+    Select the conditioning images named by ``indices`` for every sample.
+
+    Args:
+        condition_image_tensors: One list of resized tensors per sample.
+        indices: Positions to keep, or None to keep them all.
+
+    Returns:
+        List[List[torch.Tensor]]: The selected tensors, one list per sample.
+
+    Raises:
+        ValueError: If a sample carries fewer images than ``indices`` names.
+
+    Example:
+        >>> select_condition_images([[a, b], [c, d]], [1])
+        [[b], [d]]
+    """
+    if indices is None:
+        return [list(tensors) for tensors in condition_image_tensors]
+    selected = []
+    for tensors in condition_image_tensors:
+        missing = [index for index in indices if not 0 <= index < len(tensors)]
+        if missing:
+            raise ValueError(
+                f"conditioning_image_indices {list(indices)} names positions {missing} "
+                f"missing from a sample that carries {len(tensors)} image(s)"
+            )
+        selected.append([tensors[index] for index in indices])
+    return selected
+
+
 def standardize_image_batch(
     images: Union[ImageSingle, ImageBatch],
     output_type: Literal['pil', 'np', 'pt'] = 'pil',

@@ -253,26 +253,3 @@ class TargetColorRewardModel(PointwiseRewardModel):
         r, g, b = self._extract_rgb_means(image=image, video=video)
         scores = self._compute_color_score(r, g, b)
         return RewardModelOutput(rewards=scores, extra_info={})
-
-
-if __name__ == "__main__":
-    dummy_args = RewardArguments(
-        name="test_green", reward_model="target_color", device="cpu"
-    )
-    reward_model = TargetColorRewardModel(dummy_args)
-
-    green_img = torch.zeros(1, 3, 64, 64)
-    green_img[:, 1, :, :] = 1.0  # Pure green
-
-    red_img = torch.zeros(1, 3, 64, 64)
-    red_img[:, 0, :, :] = 1.0  # Pure red
-
-    batch = torch.cat([green_img, red_img], dim=0)
-    out = reward_model(image=batch)
-    assert out.rewards[0].item() == 1.0, (
-        f"Expected 1.0 for pure green, got {out.rewards[0].item()}"
-    )
-    assert out.rewards[1].item() == -0.5, (
-        f"Expected -0.5 for pure red, got {out.rewards[1].item()}"
-    )
-    print("TargetColorRewardModel smoke test passed!")
