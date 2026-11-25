@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 TASK_ID = "T018"
 
 # ---------------------------------------------------------------- term contract
@@ -713,6 +713,16 @@ def arm_coverage_term(result_points: Mapping[str, Mapping[str, float]], label_ma
     gates the score. Without a coverage profile in the cache the term cannot say
     anything about this garment and returns 0.0 with a flag.
 
+    Patch 4: a ``review`` garment abstains. That bin is the classifier saying the wearing
+    photo's own sleeve could not be placed -- the measurement is missing, or the forearm
+    coverage landed between the short and long thresholds -- so the profile this term
+    scores against is the very measurement that failed. Scoring it anyway damped a real
+    sleeve defect five to eight times over (the same corruption reads -0.79 on a ``short``
+    garment and -0.12 on a ``review`` one) and charged every clean ``review`` candidate a
+    constant it had not earned. The term returns 0.0 with a flag instead: 0.0 is the
+    perfect-match end of its range, so it contributes nothing to :func:`combine` and the
+    reward simply does not vote on a sleeve it cannot define.
+
     Patch 3: an arm the person had and the result lost is a defect, not missing data. The
     old code dropped an unmeasurable arm and averaged whatever was left, so panel-11 --
     two arms on the person, one shoulder-to-wrist chain gone on the result, an obvious
@@ -811,6 +821,12 @@ def arm_coverage_term(result_points: Mapping[str, Mapping[str, float]], label_ma
     errors = list(arm_errors.values())
     penalty = 0.5 * float(np.mean(errors)) + 0.5 * float(np.max(errors))
     detail.update({"mode": "coverage_profile", "penalty": penalty})
+    if bin_label == "review":
+        # Patch 4: no signal where the sleeve itself is undefined. The measured penalty
+        # still rides along in the details, so a report can show what the term would
+        # have said without letting it vote.
+        detail.update({"mode": "abstain_bin_review", "withheld_value": _arm_value(penalty)})
+        return {"value": 0.0, "flag": "arm_coverage_bin_review", **detail}
     return {"value": _arm_value(penalty), "flag": "", **detail}
 
 
@@ -1360,6 +1376,10 @@ def term_contract() -> dict[str, Any]:
                 "arm_disagreement": SLEEVE_ARM_DISAGREEMENT,
             },
             "bins_are_scoring": False,
+            "abstain_bins": ["review"],
+            "abstain_value": "0.0 with the flag arm_coverage_bin_review: the wearing photo's "
+                             "sleeve could not be classified, so the profile this term scores "
+                             "against is the measurement that failed",
             "segments": ["shoulder_to_elbow", "elbow_to_wrist"],
             "segments_compared": list(ARM_SEGMENTS),
             "error": "two-sided: |measured garment coverage - the garment's own coverage|",
